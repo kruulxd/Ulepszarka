@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ulepszator by Kruul
 // @namespace    http://tampermonkey.net/
-// @version      0.1
+// @version      0.2
 // @description  Auto ulepszanie i QoL do Margonem
 // @author       Kruul
 // @match        https://*.margonem.pl/
@@ -2059,7 +2059,7 @@ const ALLOWED_ITEM_TYPES = [
     initViewportResizeHandler() {
       let resizeTimeout = null;
 
-      window.addEventListener("resize", () => {
+      const scheduleViewportCorrection = () => {
         if (resizeTimeout) {
           clearTimeout(resizeTimeout);
         }
@@ -2067,7 +2067,21 @@ const ALLOWED_ITEM_TYPES = [
         resizeTimeout = setTimeout(() => {
           Ui.ensureFloatingUiVisible();
         }, 80);
+      };
+
+      window.addEventListener("resize", () => {
+        scheduleViewportCorrection();
       });
+
+      window.addEventListener("orientationchange", () => {
+        scheduleViewportCorrection();
+      });
+
+      const viewport = window.visualViewport;
+      if (viewport) {
+        viewport.addEventListener("resize", scheduleViewportCorrection);
+        viewport.addEventListener("scroll", scheduleViewportCorrection);
+      }
     },
 
     initButtonDrag() {
