@@ -1,12 +1,12 @@
 // ==UserScript==
-// @name         ulepszator
+// @name         ulepszator by Kruul
 // @namespace    http://tampermonkey.net/
-// @version      0.1.1
+// @version      0.1
 // @description  Auto ulepszanie i QoL do Margonem
-// @author       You
+// @author       Kruul
 // @match        https://*.margonem.pl/
-// @updateURL    https://raw.githubusercontent.com/TWOJ_LOGIN/TWOJE_REPO/main/ulepszarka-wild.user.js
-// @downloadURL  https://raw.githubusercontent.com/TWOJ_LOGIN/TWOJE_REPO/main/ulepszarka-wild.user.js
+// @updateURL    https://raw.githubusercontent.com/kruulxd/Ulepszarka/main/ulepszarka-wild.user.js
+// @downloadURL  https://raw.githubusercontent.com/kruulxd/Ulepszarka/main/ulepszarka-wild.user.js
 // @grant        none
 // ==/UserScript==
 
