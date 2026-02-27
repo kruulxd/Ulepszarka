@@ -1967,6 +1967,109 @@ const ALLOWED_ITEM_TYPES = [
       Storage.setPanelPosition({ left: finalLeft, top: finalTop, right: null });
     },
 
+    keepElementInViewport(element, fallbackPosition = {}) {
+      if (!element) return;
+
+      const rect = element.getBoundingClientRect();
+      const maxLeft = Math.max(window.innerWidth - rect.width, 0);
+      const maxTop = Math.max(window.innerHeight - rect.height, 0);
+
+      const computed = window.getComputedStyle(element);
+      const parsedLeft = Utils.toNumber(parseFloat(element.style.left), NaN);
+      const parsedTop = Utils.toNumber(parseFloat(element.style.top), NaN);
+      const parsedRight = Utils.toNumber(parseFloat(element.style.right), NaN);
+      const computedLeft = Utils.toNumber(parseFloat(computed.left), NaN);
+      const computedTop = Utils.toNumber(parseFloat(computed.top), NaN);
+
+      let currentLeft = Number.isFinite(parsedLeft)
+        ? parsedLeft
+        : Number.isFinite(computedLeft)
+        ? computedLeft
+        : null;
+      let currentTop = Number.isFinite(parsedTop)
+        ? parsedTop
+        : Number.isFinite(computedTop)
+        ? computedTop
+        : null;
+
+      if (currentLeft === null && Number.isFinite(parsedRight)) {
+        currentLeft = window.innerWidth - rect.width - parsedRight;
+      }
+
+      if (currentLeft === null && typeof fallbackPosition?.left === "number") {
+        currentLeft = fallbackPosition.left;
+      }
+
+      if (currentLeft === null && typeof fallbackPosition?.right === "number") {
+        currentLeft = window.innerWidth - rect.width - fallbackPosition.right;
+      }
+
+      if (currentTop === null && typeof fallbackPosition?.top === "number") {
+        currentTop = fallbackPosition.top;
+      }
+
+      const safeLeft = Utils.clamp(
+        Math.round(Utils.toNumber(currentLeft, 0)),
+        0,
+        maxLeft
+      );
+      const safeTop = Utils.clamp(
+        Math.round(Utils.toNumber(currentTop, 0)),
+        0,
+        maxTop
+      );
+
+      element.style.left = `${safeLeft}px`;
+      element.style.top = `${safeTop}px`;
+      element.style.right = "auto";
+    },
+
+    ensureFloatingUiVisible() {
+      const button = document.getElementById("upgrader-launcher");
+      if (button) {
+        Ui.keepElementInViewport(button, Storage.getGuiPosition());
+
+        const buttonLeft = Utils.toNumber(parseFloat(button.style.left), NaN);
+        const buttonTop = Utils.toNumber(parseFloat(button.style.top), NaN);
+        if (Number.isFinite(buttonLeft) && Number.isFinite(buttonTop)) {
+          Storage.setGuiPosition({
+            left: Math.round(buttonLeft),
+            top: Math.round(buttonTop),
+            right: null,
+          });
+        }
+      }
+
+      const panel = document.getElementById("upgrader-gui-panel");
+      if (panel) {
+        Ui.keepElementInViewport(panel, Storage.getPanelPosition());
+
+        const panelLeft = Utils.toNumber(parseFloat(panel.style.left), NaN);
+        const panelTop = Utils.toNumber(parseFloat(panel.style.top), NaN);
+        if (Number.isFinite(panelLeft) && Number.isFinite(panelTop)) {
+          Storage.setPanelPosition({
+            left: Math.round(panelLeft),
+            top: Math.round(panelTop),
+            right: null,
+          });
+        }
+      }
+    },
+
+    initViewportResizeHandler() {
+      let resizeTimeout = null;
+
+      window.addEventListener("resize", () => {
+        if (resizeTimeout) {
+          clearTimeout(resizeTimeout);
+        }
+
+        resizeTimeout = setTimeout(() => {
+          Ui.ensureFloatingUiVisible();
+        }, 80);
+      });
+    },
+
     initButtonDrag() {
       const button = document.getElementById("upgrader-launcher");
       const handle = document.getElementById("upgrader-launcher-title");
@@ -2176,6 +2279,8 @@ const ALLOWED_ITEM_TYPES = [
 
       Ui.applyButtonPosition();
       Ui.applyPanelPosition();
+      Ui.ensureFloatingUiVisible();
+      Ui.initViewportResizeHandler();
       Ui.initButtonDrag();
       Ui.initPanelDrag();
       Ui.bindLauncherButtons();
