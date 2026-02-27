@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ulepszator by Kruul
 // @namespace    http://tampermonkey.net/
-// @version      0.2
+// @version      0.1.1
 // @description  Auto ulepszanie i QoL do Margonem
 // @author       Kruul
 // @match        https://*.margonem.pl/
@@ -115,6 +115,7 @@ const ALLOWED_ITEM_TYPES = [
     lastProgressEventAt: 0,
     isEnhancing: false,
     lastAutoTriggerAt: 0,
+    viewportSize: null,
   };
 
   const Utils = {
@@ -2024,10 +2025,67 @@ const ALLOWED_ITEM_TYPES = [
       element.style.right = "auto";
     },
 
-    ensureFloatingUiVisible() {
+    getViewportSize() {
+      const viewport = window.visualViewport;
+      if (viewport && Number.isFinite(viewport.width) && Number.isFinite(viewport.height)) {
+        return {
+          width: Math.max(1, Math.round(viewport.width)),
+          height: Math.max(1, Math.round(viewport.height)),
+        };
+      }
+
+      return {
+        width: Math.max(1, window.innerWidth || 1),
+        height: Math.max(1, window.innerHeight || 1),
+      };
+    },
+
+    keepElementRelativeOnResize(element, fallbackPosition, resizeMeta) {
+      if (!element || !resizeMeta) return;
+
+      const { previousWidth, previousHeight, width, height } = resizeMeta;
+      if (
+        !Number.isFinite(previousWidth) ||
+        !Number.isFinite(previousHeight) ||
+        previousWidth <= 0 ||
+        previousHeight <= 0
+      ) {
+        Ui.keepElementInViewport(element, fallbackPosition);
+        return;
+      }
+
+      Ui.keepElementInViewport(element, fallbackPosition);
+
+      const rect = element.getBoundingClientRect();
+      const currentLeft = Utils.toNumber(parseFloat(element.style.left), 0);
+      const currentTop = Utils.toNumber(parseFloat(element.style.top), 0);
+
+      const scaledLeft = (currentLeft / previousWidth) * width;
+      const scaledTop = (currentTop / previousHeight) * height;
+
+      const maxLeft = Math.max(width - rect.width, 0);
+      const maxTop = Math.max(height - rect.height, 0);
+
+      const safeLeft = Utils.clamp(Math.round(scaledLeft), 0, maxLeft);
+      const safeTop = Utils.clamp(Math.round(scaledTop), 0, maxTop);
+
+      element.style.left = `${safeLeft}px`;
+      element.style.top = `${safeTop}px`;
+      element.style.right = "auto";
+    },
+
+    ensureFloatingUiVisible(resizeMeta = null) {
       const button = document.getElementById("upgrader-launcher");
       if (button) {
-        Ui.keepElementInViewport(button, Storage.getGuiPosition());
+        if (resizeMeta) {
+          Ui.keepElementRelativeOnResize(
+            button,
+            Storage.getGuiPosition(),
+            resizeMeta
+          );
+        } else {
+          Ui.keepElementInViewport(button, Storage.getGuiPosition());
+        }
 
         const buttonLeft = Utils.toNumber(parseFloat(button.style.left), NaN);
         const buttonTop = Utils.toNumber(parseFloat(button.style.top), NaN);
@@ -2042,7 +2100,15 @@ const ALLOWED_ITEM_TYPES = [
 
       const panel = document.getElementById("upgrader-gui-panel");
       if (panel) {
-        Ui.keepElementInViewport(panel, Storage.getPanelPosition());
+        if (resizeMeta) {
+          Ui.keepElementRelativeOnResize(
+            panel,
+            Storage.getPanelPosition(),
+            resizeMeta
+          );
+        } else {
+          Ui.keepElementInViewport(panel, Storage.getPanelPosition());
+        }
 
         const panelLeft = Utils.toNumber(parseFloat(panel.style.left), NaN);
         const panelTop = Utils.toNumber(parseFloat(panel.style.top), NaN);
@@ -2065,7 +2131,17 @@ const ALLOWED_ITEM_TYPES = [
         }
 
         resizeTimeout = setTimeout(() => {
-          Ui.ensureFloatingUiVisible();
+          const nextViewportSize = Ui.getViewportSize();
+          const previousViewportSize = state.viewportSize || nextViewportSize;
+
+          Ui.ensureFloatingUiVisible({
+            previousWidth: previousViewportSize.width,
+            previousHeight: previousViewportSize.height,
+            width: nextViewportSize.width,
+            height: nextViewportSize.height,
+          });
+
+          state.viewportSize = nextViewportSize;
         }, 80);
       };
 
@@ -2294,6 +2370,7 @@ const ALLOWED_ITEM_TYPES = [
       Ui.applyButtonPosition();
       Ui.applyPanelPosition();
       Ui.ensureFloatingUiVisible();
+      state.viewportSize = Ui.getViewportSize();
       Ui.initViewportResizeHandler();
       Ui.initButtonDrag();
       Ui.initPanelDrag();
