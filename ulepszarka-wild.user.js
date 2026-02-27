@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ulepszator by Kruul
 // @namespace    http://tampermonkey.net/
-// @version      0.1.1
+// @version      0.1.2
 // @description  Auto ulepszanie i QoL do Margonem
 // @author       Kruul
 // @match        https://*.margonem.pl/
@@ -347,10 +347,18 @@ const ALLOWED_ITEM_TYPES = [
     },
 
     getEnhanceCounterKey() {
-      return `upgrader-enhance-counter-charId-${Engine.hero.d.id}`;
+      return "upgrader-enhance-counter-shared";
     },
 
     getDailyEnhancePointsKey() {
+      return "upgrader-daily-enhance-points-shared";
+    },
+
+    getLegacyEnhanceCounterKey() {
+      return `upgrader-enhance-counter-charId-${Engine.hero.d.id}`;
+    },
+
+    getLegacyDailyEnhancePointsKey() {
       return `upgrader-daily-enhance-points-charId-${Engine.hero.d.id}`;
     },
 
@@ -611,15 +619,20 @@ const ALLOWED_ITEM_TYPES = [
 
     getEnhanceCounter() {
       const saved = window.localStorage.getItem(Storage.getEnhanceCounterKey());
-      if (!saved) return null;
+      const legacySaved = window.localStorage.getItem(
+        Storage.getLegacyEnhanceCounterKey()
+      );
+      const valueToRead = saved || legacySaved;
+      if (!valueToRead) return null;
 
       try {
-        const parsedPayload = JSON.parse(saved);
+        const parsedPayload = JSON.parse(valueToRead);
         const savedText = String(parsedPayload?.text || "").trim();
         const savedAt = Utils.toNumber(parsedPayload?.savedAt, NaN);
 
         if (!savedText || !Number.isFinite(savedAt)) {
           window.localStorage.removeItem(Storage.getEnhanceCounterKey());
+          window.localStorage.removeItem(Storage.getLegacyEnhanceCounterKey());
           return null;
         }
 
@@ -628,13 +641,20 @@ const ALLOWED_ITEM_TYPES = [
 
         if (!currentCycleKey || !savedCycleKey || currentCycleKey !== savedCycleKey) {
           window.localStorage.removeItem(Storage.getEnhanceCounterKey());
+          window.localStorage.removeItem(Storage.getLegacyEnhanceCounterKey());
           return null;
         }
 
         const parsedCounter = Utils.parseEnhanceCounter(savedText);
+
+        if (parsedCounter && !saved && legacySaved) {
+          Storage.setEnhanceCounter(parsedCounter.text);
+        }
+
         return parsedCounter ? parsedCounter.text : null;
       } catch (error) {
         window.localStorage.removeItem(Storage.getEnhanceCounterKey());
+        window.localStorage.removeItem(Storage.getLegacyEnhanceCounterKey());
         return null;
       }
     },
@@ -654,15 +674,20 @@ const ALLOWED_ITEM_TYPES = [
 
     getDailyEnhancePoints() {
       const saved = window.localStorage.getItem(Storage.getDailyEnhancePointsKey());
-      if (!saved) return CONFIG.DAILY_POINTS_DEFAULT;
+      const legacySaved = window.localStorage.getItem(
+        Storage.getLegacyDailyEnhancePointsKey()
+      );
+      const valueToRead = saved || legacySaved;
+      if (!valueToRead) return CONFIG.DAILY_POINTS_DEFAULT;
 
       try {
-        const payload = JSON.parse(saved);
+        const payload = JSON.parse(valueToRead);
         const points = Math.max(0, Math.floor(Utils.toNumber(payload?.points, 0)));
         const savedAt = Utils.toNumber(payload?.savedAt, NaN);
 
         if (!Number.isFinite(savedAt)) {
           window.localStorage.removeItem(Storage.getDailyEnhancePointsKey());
+          window.localStorage.removeItem(Storage.getLegacyDailyEnhancePointsKey());
           return CONFIG.DAILY_POINTS_DEFAULT;
         }
 
@@ -671,12 +696,18 @@ const ALLOWED_ITEM_TYPES = [
 
         if (!currentCycleKey || !savedCycleKey || currentCycleKey !== savedCycleKey) {
           window.localStorage.removeItem(Storage.getDailyEnhancePointsKey());
+          window.localStorage.removeItem(Storage.getLegacyDailyEnhancePointsKey());
           return CONFIG.DAILY_POINTS_DEFAULT;
+        }
+
+        if (!saved && legacySaved) {
+          Storage.setDailyEnhancePoints(points);
         }
 
         return points;
       } catch (error) {
         window.localStorage.removeItem(Storage.getDailyEnhancePointsKey());
+        window.localStorage.removeItem(Storage.getLegacyDailyEnhancePointsKey());
         return CONFIG.DAILY_POINTS_DEFAULT;
       }
     },
