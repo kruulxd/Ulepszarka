@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ulepszator by Kruul
 // @namespace    http://tampermonkey.net/
-// @version      0.1.2
+// @version      0.1.3
 // @description  Auto ulepszanie i QoL do Margonem
 // @author       Kruul
 // @match        https://*.margonem.pl/
@@ -265,6 +265,21 @@ const ALLOWED_ITEM_TYPES = [
         limit,
         text: `${current}/${limit}`,
       };
+    },
+
+    getEnhanceCounterSnapshot() {
+      const source =
+        document.querySelector(".enhance__counter") ||
+        document.querySelector("span.enhance_counter") ||
+        document.querySelector(".enhance_counter");
+      const parsedFromDom = Utils.parseEnhanceCounter(source?.textContent?.trim());
+      if (parsedFromDom) return parsedFromDom;
+
+      const parsedFromState = Utils.parseEnhanceCounter(state.enhanceCounter);
+      if (parsedFromState) return parsedFromState;
+
+      const cached = Storage.getEnhanceCounter();
+      return Utils.parseEnhanceCounter(cached);
     },
 
     parsePointsNumber(rawText) {
@@ -1212,6 +1227,14 @@ const ALLOWED_ITEM_TYPES = [
       .upgrader-crafting-window {
         display: none !important;
       }
+      .upgrader-launcher,
+      .upgrader-launcher *,
+      .upgrader-gui-panel,
+      .upgrader-gui-panel *,
+      .upgrader-label,
+      .menu-item--yellow {
+        font-family: "Segoe UI Variable", "Segoe UI", "Trebuchet MS", Tahoma, sans-serif !important;
+      }
       .menu-item--yellow {
         background: linear-gradient(90deg, #5b8cff, #a855f7) !important;
         color: #fff !important;
@@ -1242,15 +1265,17 @@ const ALLOWED_ITEM_TYPES = [
             color: #e6eef8;
             cursor: url(https://pub-05e2f98fb5b34633ae42c4866ef64081.r2.dev/assets/img/cursor/1n.png), auto;
             font-weight: 700;
-            font-family: Arial, sans-serif;
+            font-family: "Segoe UI Variable", "Segoe UI", "Trebuchet MS", Tahoma, sans-serif;
             box-shadow: 0 8px 24px rgba(2, 6, 23, 0.6);
             user-select: none;
             padding: 6px;
             box-sizing: border-box;
           }
           .upgrader-launcher-title {
-            font-size: 12px;
-            font-weight: 700;
+            font-size: 13px;
+            font-weight: 800;
+            letter-spacing: 0.3px;
+            text-transform: uppercase;
             text-align: center;
             cursor: move;
             color: #a855f7;
@@ -1288,8 +1313,8 @@ const ALLOWED_ITEM_TYPES = [
             background: rgba(255,255,255,0.03);
             color: #e6eef8;
             height: 24px;
-            font-family: Arial, sans-serif;
             font-size: 10px;
+            font-weight: 700;
             cursor: url(https://pub-05e2f98fb5b34633ae42c4866ef64081.r2.dev/assets/img/cursor/1n.png), auto;
           }
           .upgrader-launcher-btn:hover {
@@ -1312,13 +1337,14 @@ const ALLOWED_ITEM_TYPES = [
             box-sizing: border-box;
             overflow: visible;
             user-select: none;
-            font-family: Arial, sans-serif;
+            font-family: "Segoe UI Variable", "Segoe UI", "Trebuchet MS", Tahoma, sans-serif;
             cursor: url(https://pub-05e2f98fb5b34633ae42c4866ef64081.r2.dev/assets/img/cursor/1n.png), auto;
             box-shadow: 0 10px 30px rgba(2, 6, 23, 0.7);
           }
           .upgrader-gui-title {
-            font-size: 13px;
-            font-weight: 700;
+            font-size: 14px;
+            font-weight: 800;
+            letter-spacing: 0.3px;
             margin-bottom: 6px;
             cursor: move;
             padding: 3px 2px;
@@ -1336,13 +1362,13 @@ const ALLOWED_ITEM_TYPES = [
             background: rgba(255,255,255,0.03);
             color: #e6eef8;
             height: 26px;
-            font-family: Arial, sans-serif;
             cursor: url(https://pub-05e2f98fb5b34633ae42c4866ef64081.r2.dev/assets/img/cursor/1n.png), auto;
           }
           .upgrader-gui-btn {
             padding: 0 8px;
             cursor: pointer;
             font-size: 11px;
+            font-weight: 700;
           }
           .upgrader-gui-btn:hover {
             background: linear-gradient(90deg, rgba(91,140,255,0.25), rgba(168,85,247,0.25));
@@ -1354,7 +1380,7 @@ const ALLOWED_ITEM_TYPES = [
               border-radius: 6px;
               padding: 6px;
               background: rgba(255,255,255,0.02);
-              font-size: 11px;
+              font-size: 10px;
               color: #9aa6bf;
             }
             .upgrader-selected-preview-wrap {
@@ -1405,6 +1431,7 @@ const ALLOWED_ITEM_TYPES = [
             }
             .upgrader-selected-preview-text {
               font-size: 11px;
+              font-weight: 600;
               color: #e6eef8;
               word-break: break-word;
             }
@@ -1416,7 +1443,9 @@ const ALLOWED_ITEM_TYPES = [
               background: rgba(255,255,255,0.02);
             }
             .upgrader-gui-rarity-title {
-              font-size: 11px;
+              font-size: 12px;
+              font-weight: 800;
+              letter-spacing: 0.2px;
               margin-bottom: 4px;
               color: #c9d8ef;
             }
@@ -1455,6 +1484,9 @@ const ALLOWED_ITEM_TYPES = [
               font-size: 11px;
               color: #e6eef8;
               margin-bottom: 4px;
+            }
+            .upgrader-bound-item span:first-child {
+              font-weight: 600;
             }
             .upgrader-bound-item:last-child {
               margin-bottom: 0;
@@ -1514,6 +1546,7 @@ const ALLOWED_ITEM_TYPES = [
             }
             .upgrader-hotkeys-label {
               font-size: 11px;
+              font-weight: 600;
               color: #c9d8ef;
               align-self: center;
             }
@@ -1524,7 +1557,6 @@ const ALLOWED_ITEM_TYPES = [
               color: #e6eef8;
               height: 22px;
               text-align: center;
-              font-family: Arial, sans-serif;
               cursor: url(https://pub-05e2f98fb5b34633ae42c4866ef64081.r2.dev/assets/img/cursor/1n.png), auto;
             }
             .upgrader-auto-wrap {
@@ -1542,6 +1574,9 @@ const ALLOWED_ITEM_TYPES = [
               margin-bottom: 6px;
               font-size: 11px;
               color: #e6eef8;
+            }
+            .upgrader-auto-row label {
+              font-weight: 600;
             }
             .upgrader-auto-slider {
               width: 100%;
@@ -2529,17 +2564,68 @@ const ALLOWED_ITEM_TYPES = [
         const chunks = Utils.chunk(reagents, CONFIG.MAX_REAGENTS);
         await EnhancementApi.setEnhancedItem(upgradedItemId);
 
+        let counterSnapshot = Utils.getEnhanceCounterSnapshot();
+        let remainingToLimit = null;
+
+        if (counterSnapshot) {
+          remainingToLimit = Math.max(
+            0,
+            counterSnapshot.limit - counterSnapshot.current
+          );
+
+          if (remainingToLimit <= 0) {
+            if (!silent) {
+              message("Limit ulepszenia został już wbity dla tego przedmiotu.");
+            }
+            return;
+          }
+        }
+
         for (const chunk of chunks) {
-          await EnhancementApi.setReagents(upgradedItemId, chunk);
+          if (remainingToLimit !== null && remainingToLimit <= 0) {
+            break;
+          }
+
+          const maxAllowedInChunk =
+            remainingToLimit === null
+              ? chunk.length
+              : Math.min(chunk.length, remainingToLimit);
+
+          if (maxAllowedInChunk <= 0) {
+            break;
+          }
+
+          const reagentsToUse =
+            maxAllowedInChunk === chunk.length
+              ? chunk
+              : chunk.slice(0, maxAllowedInChunk);
+
+          await EnhancementApi.setReagents(upgradedItemId, reagentsToUse);
           const previewPoints = Utils.getEnhancePreviewPoints();
           const enhanceItemResponse = await EnhancementApi.enhanceItem(
             upgradedItemId,
-            chunk
+            reagentsToUse
           );
 
           const { count, limit } = enhanceItemResponse.enhancement.usages_preview;
           const upgradeLevel =
             enhanceItemResponse?.enhancement?.progressing?.upgradeLevel ?? "?";
+
+          const parsedCount = Utils.toNumber(count, NaN);
+          const parsedLimit = Utils.toNumber(limit, NaN);
+          if (Number.isFinite(parsedCount) && Number.isFinite(parsedLimit)) {
+            remainingToLimit = Math.max(0, parsedLimit - parsedCount);
+            counterSnapshot = {
+              current: parsedCount,
+              limit: parsedLimit,
+              text: `${parsedCount}/${parsedLimit}`,
+            };
+            state.enhanceCounter = counterSnapshot.text;
+            Storage.setEnhanceCounter(counterSnapshot.text);
+          } else if (remainingToLimit !== null) {
+            remainingToLimit = Math.max(0, remainingToLimit - reagentsToUse.length);
+          }
+
           message(
             Utils.formatEnhanceProgressMessage({
               itemName: upgradedItem.name,
