@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ulepszator by Kruul
 // @namespace    http://tampermonkey.net/
-// @version      0.1.3
+// @version      0.1.4
 // @description  Auto ulepszanie i QoL do Margonem
 // @author       Kruul
 // @match        https://*.margonem.pl/
@@ -1077,6 +1077,9 @@ const ALLOWED_ITEM_TYPES = [
 
     getFreeSlotsInfo() {
       const candidates = [];
+      const EXCLUDED_BAG_SLOT_SELECTOR = ".bag-4-slot";
+      const isInExcludedBagSlot = (node) =>
+        Boolean(node?.closest?.(EXCLUDED_BAG_SLOT_SELECTOR));
 
       const addCandidate = (freeSlots, source, extra = {}) => {
         if (typeof freeSlots !== "number" || !Number.isFinite(freeSlots)) return;
@@ -1108,7 +1111,9 @@ const ALLOWED_ITEM_TYPES = [
         }
       }
 
-      const bagNodes = [...document.querySelectorAll(".item.bag")];
+      const bagNodes = [...document.querySelectorAll(".item.bag")].filter(
+        (node) => !isInExcludedBagSlot(node)
+      );
       if (bagNodes.length > 0) {
         let hasParsedBagAmount = false;
         const freeFromBags = bagNodes.reduce((sum, node) => {
@@ -1141,7 +1146,12 @@ const ALLOWED_ITEM_TYPES = [
       ];
 
       const emptyCount = emptySelectors
-        .map((selector) => document.querySelectorAll(selector).length)
+        .map(
+          (selector) =>
+            [...document.querySelectorAll(selector)].filter(
+              (node) => !isInExcludedBagSlot(node)
+            ).length
+        )
         .reduce((sum, count) => sum + count, 0);
 
       if (emptyCount > 0) {
@@ -1155,7 +1165,9 @@ const ALLOWED_ITEM_TYPES = [
         document.querySelector(".scroll-pane");
 
       if (inventoryRoot) {
-        const totalSlots = inventoryRoot.querySelectorAll(".item, .slot").length;
+        const totalSlots = [...inventoryRoot.querySelectorAll(".item, .slot")].filter(
+          (node) => !isInExcludedBagSlot(node)
+        ).length;
         const occupiedSlots = Engine.items.fetchLocationItems("g").length;
 
         if (totalSlots > 0 && totalSlots >= occupiedSlots) {
@@ -1165,7 +1177,9 @@ const ALLOWED_ITEM_TYPES = [
           });
         }
 
-        const allItemNodes = [...inventoryRoot.querySelectorAll(".item")];
+        const allItemNodes = [...inventoryRoot.querySelectorAll(".item")].filter(
+          (node) => !isInExcludedBagSlot(node)
+        );
         const occupiedFromDom = allItemNodes.filter((node) => {
           const className = typeof node.className === "string" ? node.className : "";
           return /item-id-\d+/.test(className);
@@ -1181,7 +1195,9 @@ const ALLOWED_ITEM_TYPES = [
 
       const scrollPane = document.querySelector(".scroll-pane");
       if (scrollPane) {
-        const slotNodes = scrollPane.querySelectorAll(".item, .slot");
+        const slotNodes = [...scrollPane.querySelectorAll(".item, .slot")].filter(
+          (node) => !isInExcludedBagSlot(node)
+        );
         if (slotNodes.length > 0) {
           const occupiedInScrollPane = [...slotNodes].filter((node) => {
             const className = typeof node.className === "string" ? node.className : "";
