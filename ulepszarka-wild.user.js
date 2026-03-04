@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ulepszator by Kruul
 // @namespace    http://tampermonkey.net/
-// @version      0.1.4
+// @version      0.1.5
 // @description  Auto ulepszanie i QoL do Margonem
 // @author       Kruul
 // @match        https://*.margonem.pl/
@@ -18,7 +18,6 @@ const CONFIG = {
     enhance: "j",
     gui: "u",
   },
-  GUI_BUTTON_TEXT: "UL",
   DEFAULT_BUTTON_POSITION: {
     left: null,
     top: 150,
@@ -103,7 +102,6 @@ const ALLOWED_ITEM_TYPES = [
 
 (function () {
   const state = {
-    windowEnabled: false,
     guiVisible: false,
     hotkeys: { ...CONFIG.DEFAULT_HOTKEYS },
     autoSettings: { ...CONFIG.DEFAULT_AUTO_SETTINGS },
@@ -141,55 +139,6 @@ const ALLOWED_ITEM_TYPES = [
       const input = String(value || "").trim().toLowerCase();
       if (!input) return fallback;
       return input[0];
-    },
-
-    extractItemIdFromText(raw) {
-      if (!raw) return null;
-
-      const text = String(raw);
-      const classMatch = text.match(/item-id-(\d+)/);
-      if (classMatch) return classMatch[1];
-
-      const pureNumber = text.match(/^\d+$/);
-      if (pureNumber) return pureNumber[0];
-
-      return null;
-    },
-
-    resolveDroppedItemId(event) {
-      const dataTransfer = event?.dataTransfer;
-      if (dataTransfer) {
-        const values = [];
-        values.push(dataTransfer.getData("text/plain"));
-        values.push(dataTransfer.getData("text"));
-        values.push(dataTransfer.getData("itemId"));
-        values.push(dataTransfer.getData("id"));
-
-        if (Array.isArray(dataTransfer.types)) {
-          dataTransfer.types.forEach((type) => {
-            values.push(dataTransfer.getData(type));
-          });
-        }
-
-        for (const value of values) {
-          const itemId = Utils.extractItemIdFromText(value);
-          if (itemId) return itemId;
-        }
-      }
-
-      const draggedNode = document.querySelector(".ui-draggable-dragging");
-      const className = draggedNode?.className;
-      const classString =
-        typeof className === "string" ? className : className?.baseVal;
-      const draggedItemId = Utils.getItemIdFromClassName(classString);
-      if (draggedItemId) return draggedItemId;
-
-      const engineItemId =
-        window.Engine?.interface?.cursorItem?.id ||
-        window.Engine?.dragAndDrop?.item?.id ||
-        window.Engine?.draggable?.item?.id;
-
-      return engineItemId ? String(engineItemId) : null;
     },
 
     clamp(value, min, max) {
@@ -328,6 +277,129 @@ const ALLOWED_ITEM_TYPES = [
       const day = String(resetDate.getDate()).padStart(2, "0");
 
       return `${year}-${month}-${day}`;
+    },
+
+    hasMaxEnhancementState(payload) {
+      if (!payload || typeof payload !== "object") return false;
+
+      const directFlags = [
+        payload?.enhancement?.isMax,
+        payload?.enhancement?.max,
+        payload?.enhancement?.maxed,
+        payload?.enhancement?.is_max,
+        payload?.enhancement?.is_maxed,
+        payload?.enhancement?.maxLevel,
+        payload?.enhancement?.max_level,
+      ];
+
+      if (directFlags.some((value) => value === true)) {
+        return true;
+      }
+
+      const enhancement = payload?.enhancement;
+      const upgradeLevel = Utils.toNumber(
+        enhancement?.progressing?.upgradeLevel ??
+          enhancement?.progressing?.upgrade_level ??
+          enhancement?.upgradeLevel ??
+          enhancement?.upgrade_level,
+        NaN
+      );
+
+      const usageCount = Utils.toNumber(
+        enhancement?.usages_preview?.count ?? enhancement?.usage?.count,
+        NaN
+      );
+      const usageLimit = Utils.toNumber(
+        enhancement?.usages_preview?.limit ?? enhancement?.usage?.limit,
+        NaN
+      );
+
+      const textProbe = Utils.normalizeText(
+        JSON.stringify([
+          payload?.error,
+          payload?.msg,
+          payload?.message,
+          payload?.tip,
+          payload?.enhancement?.error,
+          payload?.enhancement?.msg,
+          payload?.enhancement?.message,
+        ])
+      );
+
+      const hasTextSignal =
+        /(maks|max).*(ulepsz|enhanc)/.test(textProbe) ||
+        /(wybierz|wybor).*(bonus)/.test(textProbe) ||
+        /(bonus).*(wybierz|wybor)/.test(textProbe);
+
+      const queue = [payload];
+      const seen = new Set();
+      let hasBonusArraySignal = false;
+      let hasLegendaryCostSignal = false;
+
+      while (queue.length > 0) {
+        const current = queue.shift();
+        if (!current || typeof current !== "object") continue;
+        if (seen.has(current)) continue;
+        seen.add(current);
+
+        if (Array.isArray(current)) {
+          if (current.length >= 3) {
+            const objectLikeCount = current.filter(
+              (entry) => entry && typeof entry === "object"
+            ).length;
+            if (objectLikeCount >= 2) {
+              hasBonusArraySignal = true;
+            }
+          }
+
+          current.forEach((entry) => queue.push(entry));
+          continue;
+        }
+
+        Object.entries(current).forEach(([rawKey, value]) => {
+          const key = Utils.normalizeText(rawKey);
+
+          if (
+            key.includes("bonus") &&
+            Array.isArray(value) &&
+            value.length >= 3
+          ) {
+            hasBonusArraySignal = true;
+          }
+
+          if (
+            (key.includes("legend") || key.includes("esenc")) &&
+            typeof value === "number" &&
+            value > 0
+          ) {
+            hasLegendaryCostSignal = true;
+          }
+
+          if (value && typeof value === "object") {
+            queue.push(value);
+          }
+        });
+      }
+
+      const looksLikeMaxLevelState =
+        hasBonusArraySignal &&
+        (hasLegendaryCostSignal || hasTextSignal || (Number.isFinite(upgradeLevel) && upgradeLevel >= 4));
+
+      const maxedByUsageCounter =
+        Number.isFinite(usageCount) &&
+        Number.isFinite(usageLimit) &&
+        usageLimit > 0 &&
+        usageCount >= usageLimit;
+
+      if (looksLikeMaxLevelState) {
+        return true;
+      }
+
+      if (maxedByUsageCounter && hasTextSignal) {
+        return true;
+      }
+
+      return false;
     },
 
   };
@@ -699,15 +771,25 @@ const ALLOWED_ITEM_TYPES = [
         const payload = JSON.parse(valueToRead);
         const points = Math.max(0, Math.floor(Utils.toNumber(payload?.points, 0)));
         const savedAt = Utils.toNumber(payload?.savedAt, NaN);
+        const payloadCycleKey = String(payload?.cycleKey || "").trim() || null;
+        const currentCycleKey = Utils.getDailyResetCycleKey();
 
-        if (!Number.isFinite(savedAt)) {
+        if (!currentCycleKey) {
           window.localStorage.removeItem(Storage.getDailyEnhancePointsKey());
           window.localStorage.removeItem(Storage.getLegacyDailyEnhancePointsKey());
           return CONFIG.DAILY_POINTS_DEFAULT;
         }
 
-        const currentCycleKey = Utils.getDailyResetCycleKey();
-        const savedCycleKey = Utils.getDailyResetCycleKey(savedAt);
+        let savedCycleKey = payloadCycleKey;
+        if (!savedCycleKey && Number.isFinite(savedAt)) {
+          savedCycleKey = Utils.getDailyResetCycleKey(savedAt);
+        }
+
+        if (!savedCycleKey) {
+          window.localStorage.removeItem(Storage.getDailyEnhancePointsKey());
+          window.localStorage.removeItem(Storage.getLegacyDailyEnhancePointsKey());
+          return CONFIG.DAILY_POINTS_DEFAULT;
+        }
 
         if (!currentCycleKey || !savedCycleKey || currentCycleKey !== savedCycleKey) {
           window.localStorage.removeItem(Storage.getDailyEnhancePointsKey());
@@ -716,6 +798,8 @@ const ALLOWED_ITEM_TYPES = [
         }
 
         if (!saved && legacySaved) {
+          Storage.setDailyEnhancePoints(points);
+        } else if (!payloadCycleKey) {
           Storage.setDailyEnhancePoints(points);
         }
 
@@ -729,12 +813,18 @@ const ALLOWED_ITEM_TYPES = [
 
     setDailyEnhancePoints(points) {
       const normalizedPoints = Math.max(0, Math.floor(Utils.toNumber(points, 0)));
+      const cycleKey = Utils.getDailyResetCycleKey();
+
+      if (!cycleKey) {
+        return normalizedPoints;
+      }
 
       window.localStorage.setItem(
         Storage.getDailyEnhancePointsKey(),
         JSON.stringify({
           points: normalizedPoints,
           savedAt: Date.now(),
+          cycleKey,
         })
       );
 
@@ -1078,8 +1168,12 @@ const ALLOWED_ITEM_TYPES = [
     getFreeSlotsInfo() {
       const candidates = [];
       const EXCLUDED_BAG_SLOT_SELECTOR = ".bag-4-slot";
+      const EXCLUDED_BAG_SELECTOR = '[data-bag="26"]';
       const isInExcludedBagSlot = (node) =>
-        Boolean(node?.closest?.(EXCLUDED_BAG_SLOT_SELECTOR));
+        Boolean(
+          node?.closest?.(EXCLUDED_BAG_SLOT_SELECTOR) ||
+            node?.closest?.(EXCLUDED_BAG_SELECTOR)
+        );
 
       const addCandidate = (freeSlots, source, extra = {}) => {
         if (typeof freeSlots !== "number" || !Number.isFinite(freeSlots)) return;
@@ -1098,18 +1192,19 @@ const ALLOWED_ITEM_TYPES = [
           directFree = null;
         }
 
-        addCandidate(directFree, "Engine.items.getFreeSlots('g')");
-
         if (!(typeof directFree === "number" && directFree >= 0)) {
           try {
             directFree = window.Engine.items.getFreeSlots();
           } catch (error) {
             directFree = null;
           }
-
-          addCandidate(directFree, "Engine.items.getFreeSlots()");
         }
       }
+
+      const excludedBagEmptySlots = [
+        ...document.querySelectorAll(`${EXCLUDED_BAG_SELECTOR} .item.empty`),
+        ...document.querySelectorAll(`${EXCLUDED_BAG_SELECTOR} .slot.empty`),
+      ].length;
 
       const bagNodes = [...document.querySelectorAll(".item.bag")].filter(
         (node) => !isInExcludedBagSlot(node)
@@ -1220,6 +1315,14 @@ const ALLOWED_ITEM_TYPES = [
         return candidates[0];
       }
 
+      if (typeof directFree === "number" && Number.isFinite(directFree)) {
+        const adjustedDirectFree = Math.max(0, directFree - excludedBagEmptySlots);
+        addCandidate(adjustedDirectFree, "Engine.items.getFreeSlots - excluded bag 26", {
+          excludedBagEmptySlots,
+        });
+        return candidates[0];
+      }
+
       return {
         freeSlots: null,
         source: "unknown",
@@ -1230,11 +1333,6 @@ const ALLOWED_ITEM_TYPES = [
       return Inventory.getFreeSlotsInfo().freeSlots;
     },
 
-    getUpgradeableCandidates() {
-      return Engine.items
-        .fetchLocationItems("g")
-        .filter((item) => ALLOWED_ITEM_TYPES.includes(item?.cl));
-    },
   };
 
   const Ui = {
@@ -1358,14 +1456,38 @@ const ALLOWED_ITEM_TYPES = [
             box-shadow: 0 10px 30px rgba(2, 6, 23, 0.7);
           }
           .upgrader-gui-title {
+            position: relative;
+            display: flex;
+            align-items: center;
             font-size: 14px;
             font-weight: 800;
             letter-spacing: 0.3px;
             margin-bottom: 6px;
             cursor: move;
-            padding: 3px 2px;
+            padding: 3px 22px 3px 2px;
             border-bottom: 1px solid rgba(91,140,255,0.22);
             color: #a855f7;
+          }
+          .upgrader-gui-close-btn {
+            position: absolute;
+            top: 50%;
+            right: 0;
+            transform: translateY(-50%);
+            width: 18px;
+            height: 18px;
+            border: 1px solid rgba(91,140,255,0.3);
+            border-radius: 5px;
+            background: rgba(255,255,255,0.03);
+            color: #e6eef8;
+            font-size: 12px;
+            font-weight: 700;
+            line-height: 1;
+            cursor: pointer;
+            padding: 0;
+          }
+          .upgrader-gui-close-btn:hover {
+            background: linear-gradient(90deg, rgba(91,140,255,0.25), rgba(168,85,247,0.25));
+            border-color: rgba(168,85,247,0.55);
           }
           .upgrader-gui-row {
             display: flex;
@@ -1605,30 +1727,11 @@ const ALLOWED_ITEM_TYPES = [
               font-size: 10px;
               color: #9aa6bf;
             }
-            .upgrader-auto-debug {
-              margin-top: 4px;
-              font-size: 10px;
-              color: #8b98b5;
-              white-space: pre-wrap;
-            }
     `;
 
       const style = document.createElement("style");
       style.appendChild(document.createTextNode(css));
       document.head.appendChild(style);
-    },
-
-    toggleEnhancementWindow() {
-      if (state.windowEnabled) {
-        Engine.crafting.window.wnd.$.removeClass("upgrader-crafting-window");
-        Engine.interface.clickCrafting();
-        state.windowEnabled = false;
-        return;
-      }
-
-      Engine.crafting.window.wnd.$.addClass("upgrader-crafting-window");
-      Engine.interface.clickCrafting();
-      state.windowEnabled = true;
     },
 
     isCraftingWindowOpen() {
@@ -1662,7 +1765,6 @@ const ALLOWED_ITEM_TYPES = [
       if (!wasOpenBeforeRun) {
         Engine.crafting.window.wnd.$.addClass("upgrader-crafting-window");
         Engine.interface.clickCrafting();
-        state.windowEnabled = true;
       }
 
       return { wasOpenBeforeRun };
@@ -1680,7 +1782,6 @@ const ALLOWED_ITEM_TYPES = [
         Engine.crafting.window.wnd.$.removeClass("upgrader-crafting-window");
       }
 
-      state.windowEnabled = false;
     },
 
     markItemAsUpgraded(prevId) {
@@ -1825,19 +1926,11 @@ const ALLOWED_ITEM_TYPES = [
 
       const freeSlotsInfo = Inventory.getFreeSlotsInfo();
       const freeSlots = freeSlotsInfo.freeSlots;
-      const debug = document.getElementById("upgrader-auto-debug");
 
       info.textContent =
         freeSlots === null
           ? "Wolne sloty: nie udało się odczytać"
           : `Wolne sloty teraz: ${freeSlots}`;
-
-      if (debug) {
-        const extra =
-          typeof freeSlotsInfo.totalSlots === "number"
-            ? ` | sloty: ${freeSlotsInfo.occupiedSlots}/${freeSlotsInfo.totalSlots}`
-            : "";
-      }
     },
 
     bindAutoSettingsHandlers() {
@@ -2249,6 +2342,7 @@ const ALLOWED_ITEM_TYPES = [
 
       handle.addEventListener("mousedown", (event) => {
         if (event.button !== 0) return;
+        if (event.target?.closest?.("#upgrader-gui-close-btn")) return;
 
         event.preventDefault();
 
@@ -2386,7 +2480,10 @@ const ALLOWED_ITEM_TYPES = [
       panel.id = "upgrader-gui-panel";
       panel.className = "upgrader-gui-panel";
       panel.innerHTML = `
-        <div id="upgrader-gui-title" class="upgrader-gui-title">QuickForge - ustawienia</div>
+        <div id="upgrader-gui-title" class="upgrader-gui-title">
+          <span>QuickForge - ustawienia</span>
+          <button id="upgrader-gui-close-btn" class="upgrader-gui-close-btn" type="button" aria-label="Zamknij panel">×</button>
+        </div>
         <div class="upgrader-select-hint">Wybór przedmiotu: kliknij PPM na itemie i użyj opcji „Ulepsz ten przedmiot”.</div>
         <div class="upgrader-selected-preview-wrap">
           <div class="upgrader-gui-rarity-title">Wybrany przedmiot:</div>
@@ -2428,7 +2525,6 @@ const ALLOWED_ITEM_TYPES = [
             value="${CONFIG.DEFAULT_AUTO_SETTINGS.minFreeSlots}"
           />
           <div id="upgrader-auto-free-slots-info" class="upgrader-auto-info"></div>
-          <div id="upgrader-auto-debug" class="upgrader-auto-debug"></div>
         </div>
         <div class="upgrader-hotkeys-wrap">
           <div class="upgrader-gui-rarity-title">Skróty klawiszowe:</div>
@@ -2487,6 +2583,19 @@ const ALLOWED_ITEM_TYPES = [
             `Zapisano skróty: ulepszanie [${savedHotkeys.enhance}], GUI [SHIFT+${savedHotkeys.gui}]`
           );
         });
+
+      const closeButton = document.getElementById("upgrader-gui-close-btn");
+      if (closeButton) {
+        closeButton.addEventListener("mousedown", (event) => {
+          event.stopPropagation();
+        });
+
+        closeButton.addEventListener("click", (event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          Ui.toggleGui();
+        });
+      }
 
       Ui.renderSelectedItemPreview();
       Ui.renderBoundSettings();
@@ -2547,38 +2656,61 @@ const ALLOWED_ITEM_TYPES = [
     async enhanceSelectedItem(options = {}) {
       const { silent = false } = options;
 
+      const result = {
+        status: "idle",
+        reachedLimit: false,
+        reachedMaxEnhancement: false,
+        itemName: null,
+      };
+
       if (state.isEnhancing) {
-        return;
+        result.status = "busy";
+        return result;
       }
 
       state.isEnhancing = true;
 
       const upgradedItemId = Storage.getUpgradedItemId();
       const upgradedItem = Engine.items.getItemById(upgradedItemId);
+      result.itemName = upgradedItem?.name || null;
 
       if (!upgradedItem) {
+        result.status = "missing-item";
         if (!silent) {
-          message("Nie znaleziono wybranego przedmiotu.");
+          message("Wybierz przedmiot do ulepszenia.");
         }
         state.isEnhancing = false;
-        return;
+        return result;
       }
 
       const reagents = Inventory.getReagents();
       if (reagents.length === 0) {
+        result.status = "missing-reagents";
         if (!silent) {
           message("Nie znaleziono odpowiednich składników.");
         }
         state.isEnhancing = false;
-        return;
+        return result;
       }
 
       let enhancementSession = null;
 
       try {
+        result.status = "running";
         enhancementSession = Ui.prepareEnhancementWindow();
         const chunks = Utils.chunk(reagents, CONFIG.MAX_REAGENTS);
-        await EnhancementApi.setEnhancedItem(upgradedItemId);
+        const statusResponse = await EnhancementApi.setEnhancedItem(upgradedItemId);
+
+        if (Utils.hasMaxEnhancementState(statusResponse)) {
+          result.reachedMaxEnhancement = true;
+          result.status = "max-enhancement-reached";
+          if (!silent) {
+            message(
+              `Przedmiot${upgradedItem?.name ? ` ${upgradedItem.name}` : ""} został maksymalnie ulepszony. Dalsze ulepszanie zostało zatrzymane.`
+            );
+          }
+          return result;
+        }
 
         let counterSnapshot = Utils.getEnhanceCounterSnapshot();
         let remainingToLimit = null;
@@ -2590,10 +2722,12 @@ const ALLOWED_ITEM_TYPES = [
           );
 
           if (remainingToLimit <= 0) {
+            result.reachedLimit = true;
+            result.status = "limit-reached";
             if (!silent) {
-              message("Limit ulepszenia został już wbity dla tego przedmiotu.");
+              message("Już wbiłeś limit na dzisiaj.");
             }
-            return;
+            return result;
           }
         }
 
@@ -2616,12 +2750,38 @@ const ALLOWED_ITEM_TYPES = [
               ? chunk
               : chunk.slice(0, maxAllowedInChunk);
 
-          await EnhancementApi.setReagents(upgradedItemId, reagentsToUse);
+          const reagentsPreviewResponse = await EnhancementApi.setReagents(
+            upgradedItemId,
+            reagentsToUse
+          );
+
+          if (Utils.hasMaxEnhancementState(reagentsPreviewResponse)) {
+            result.reachedMaxEnhancement = true;
+            result.status = "max-enhancement-reached";
+            if (!silent) {
+              message(
+                `Przedmiot${upgradedItem?.name ? ` ${upgradedItem.name}` : ""} został maksymalnie ulepszony. Dalsze ulepszanie zostało zatrzymane.`
+              );
+            }
+            return result;
+          }
+
           const previewPoints = Utils.getEnhancePreviewPoints();
           const enhanceItemResponse = await EnhancementApi.enhanceItem(
             upgradedItemId,
             reagentsToUse
           );
+
+          if (Utils.hasMaxEnhancementState(enhanceItemResponse)) {
+            result.reachedMaxEnhancement = true;
+            result.status = "max-enhancement-reached";
+            if (!silent) {
+              message(
+                `Przedmiot${upgradedItem?.name ? ` ${upgradedItem.name}` : ""} został maksymalnie ulepszony. Dalsze ulepszanie zostało zatrzymane.`
+              );
+            }
+            return result;
+          }
 
           const { count, limit } = enhanceItemResponse.enhancement.usages_preview;
           const upgradeLevel =
@@ -2638,6 +2798,11 @@ const ALLOWED_ITEM_TYPES = [
             };
             state.enhanceCounter = counterSnapshot.text;
             Storage.setEnhanceCounter(counterSnapshot.text);
+
+            if (remainingToLimit <= 0) {
+              result.reachedLimit = true;
+              result.status = "limit-reached";
+            }
           } else if (remainingToLimit !== null) {
             remainingToLimit = Math.max(0, remainingToLimit - reagentsToUse.length);
           }
@@ -2654,11 +2819,17 @@ const ALLOWED_ITEM_TYPES = [
 
           await Utils.sleep(300);
         }
+
+        if (result.status !== "limit-reached") {
+          result.status = "done";
+        }
       } finally {
         Ui.restoreEnhancementWindow(enhancementSession);
         state.isEnhancing = false;
         Ui.refreshEnhanceCounter();
       }
+
+      return result;
     },
 
     async checkAutoEnhance() {
@@ -2681,7 +2852,27 @@ const ALLOWED_ITEM_TYPES = [
       }
 
       state.lastAutoTriggerAt = now;
-      await Automation.enhanceSelectedItem({ silent: true });
+      const enhanceResult = await Automation.enhanceSelectedItem({ silent: true });
+
+      if (enhanceResult?.reachedLimit || enhanceResult?.reachedMaxEnhancement) {
+        state.autoSettings = Storage.setAutoSettings({
+          ...state.autoSettings,
+          enabled: false,
+        });
+
+        const targetItemLabel = enhanceResult.itemName
+          ? ` dla ${enhanceResult.itemName}`
+          : "";
+
+        if (enhanceResult?.reachedMaxEnhancement) {
+          message(
+            `Auto ulepszanie wyłączone: przedmiot${targetItemLabel} jest już maksymalnie ulepszony.`
+          );
+        } else {
+          message(`Auto ulepszanie wyłączone: osiągnięto limit ulepszeń${targetItemLabel}.`);
+        }
+      }
+
       Ui.renderAutoSettings();
     },
 
