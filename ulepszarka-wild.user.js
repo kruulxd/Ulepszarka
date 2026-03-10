@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         ulepszator by Kruul
 // @namespace    http://tampermonkey.net/
-// @version      0.1.5
-// @description  Auto ulepszanie i QoL do Margonem
+// @version      0.1.6
+// @description  Auto ulepszanie i rozbijanie
 // @author       Kruul
 // @match        https://*.margonem.pl/
 // @updateURL    https://raw.githubusercontent.com/kruulxd/Ulepszarka/main/ulepszarka-wild.user.js
@@ -13,9 +13,12 @@
 const CONFIG = {
   DEFAULT_ALLOWED_RARITIES: ["common"],
   AVAILABLE_RARITIES: ["common", "unique", "heroic"],
+  DEFAULT_MODE: "enhancement",
+  AVAILABLE_MODES: ["enhancement", "salvage"],
   MAX_REAGENTS: 25,
   DEFAULT_HOTKEYS: {
     enhance: "j",
+    salvage: "k",
     gui: "u",
   },
   DEFAULT_BUTTON_POSITION: {
@@ -112,8 +115,12 @@ const ALLOWED_ITEM_TYPES = [
     lastProgressEventKey: null,
     lastProgressEventAt: 0,
     isEnhancing: false,
+    mode: CONFIG.DEFAULT_MODE,
     lastAutoTriggerAt: 0,
     viewportSize: null,
+    hasInterfaceWidget: false,
+    interfaceWidgetDragObserver: null,
+    launcherVisible: false,
   };
 
   const Utils = {
@@ -175,24 +182,6 @@ const ALLOWED_ITEM_TYPES = [
       if (!text) return "Przedmiot";
       if (text.length <= maxLength) return text;
       return `${text.slice(0, Math.max(0, maxLength - 1))}…`;
-    },
-
-    formatEnhanceProgressMessage({
-      itemName,
-      count,
-      limit,
-      upgradeLevel,
-      points,
-    }) {
-      const safeName = Utils.truncateText(itemName, 28);
-      const safeCount = Number.isFinite(Number(count)) ? Number(count) : "?";
-      const safeLimit = Number.isFinite(Number(limit)) ? Number(limit) : "?";
-      const safeLevel = String(upgradeLevel ?? "?");
-      const safePoints = Math.max(0, Math.floor(Utils.toNumber(points, 0)));
-
-      return `${safeName} | ${safeCount}/${safeLimit} | +${safeLevel} | +${Utils.formatPoints(
-        safePoints
-      )} pkt`;
     },
 
     parseEnhanceCounter(rawText) {
@@ -425,12 +414,20 @@ const ALLOWED_ITEM_TYPES = [
       return `upgrader-panel-position-charId-${Engine.hero.d.id}`;
     },
 
+    getWidgetSlotKey() {
+      return `upgrader-widget-slot-charId-${Engine.hero.d.id}`;
+    },
+
     getAutoSettingsKey() {
       return `upgrader-auto-settings-charId-${Engine.hero.d.id}`;
     },
 
     getBoundSettingsKey() {
       return `upgrader-bound-settings-charId-${Engine.hero.d.id}`;
+    },
+
+    getModeKey() {
+      return `upgrader-mode-charId-${Engine.hero.d.id}`;
     },
 
     getEnhanceCounterKey() {
@@ -497,13 +494,33 @@ const ALLOWED_ITEM_TYPES = [
 
       try {
         const parsed = JSON.parse(saved);
-        return {
+        if (!parsed || typeof parsed !== "object") {
+          return { ...CONFIG.DEFAULT_HOTKEYS };
+        }
+
+        const hasLegacyExtract = Object.prototype.hasOwnProperty.call(
+          parsed,
+          "extract"
+        );
+        const hasSalvage = Object.prototype.hasOwnProperty.call(parsed, "salvage");
+        const legacySalvageHotkey = parsed?.salvage ?? parsed?.extract;
+        const normalized = {
           enhance: Utils.normalizeHotkey(
             parsed?.enhance,
             CONFIG.DEFAULT_HOTKEYS.enhance
           ),
+          salvage: Utils.normalizeHotkey(
+            legacySalvageHotkey,
+            CONFIG.DEFAULT_HOTKEYS.salvage
+          ),
           gui: Utils.normalizeHotkey(parsed?.gui, CONFIG.DEFAULT_HOTKEYS.gui),
         };
+
+        if (hasLegacyExtract && !hasSalvage) {
+          Storage.setHotkeys(normalized);
+        }
+
+        return normalized;
       } catch (error) {
         return { ...CONFIG.DEFAULT_HOTKEYS };
       }
@@ -514,6 +531,10 @@ const ALLOWED_ITEM_TYPES = [
         enhance: Utils.normalizeHotkey(
           hotkeys?.enhance,
           CONFIG.DEFAULT_HOTKEYS.enhance
+        ),
+        salvage: Utils.normalizeHotkey(
+          hotkeys?.salvage,
+          CONFIG.DEFAULT_HOTKEYS.salvage
         ),
         gui: Utils.normalizeHotkey(hotkeys?.gui, CONFIG.DEFAULT_HOTKEYS.gui),
       };
@@ -624,6 +645,44 @@ const ALLOWED_ITEM_TYPES = [
       return normalized;
     },
 
+    getWidgetSlot() {
+      const saved = window.localStorage.getItem(Storage.getWidgetSlotKey());
+      if (!saved) return null;
+
+      try {
+        const parsed = JSON.parse(saved);
+        const widgetPos = parsed?.widgetPos === "top-right" ? "top-right" : "top-left";
+        const slot = Math.max(0, Math.floor(Utils.toNumber(parsed?.slot, 0)));
+        const widgetIndex = Math.max(0, Math.floor(Utils.toNumber(parsed?.widgetIndex, slot)));
+
+        return {
+          widgetPos,
+          slot,
+          widgetIndex,
+        };
+      } catch (error) {
+        return null;
+      }
+    },
+
+    setWidgetSlot(slotConfig) {
+      const normalized = {
+        widgetPos: slotConfig?.widgetPos === "top-right" ? "top-right" : "top-left",
+        slot: Math.max(0, Math.floor(Utils.toNumber(slotConfig?.slot, 0))),
+        widgetIndex: Math.max(
+          0,
+          Math.floor(Utils.toNumber(slotConfig?.widgetIndex, slotConfig?.slot ?? 0))
+        ),
+      };
+
+      window.localStorage.setItem(
+        Storage.getWidgetSlotKey(),
+        JSON.stringify(normalized)
+      );
+
+      return normalized;
+    },
+
     getAutoSettings() {
       const saved = window.localStorage.getItem(Storage.getAutoSettingsKey());
       if (!saved) {
@@ -701,6 +760,30 @@ const ALLOWED_ITEM_TYPES = [
         JSON.stringify(normalized)
       );
 
+      return normalized;
+    },
+
+    getMode() {
+      const saved = window.localStorage.getItem(Storage.getModeKey());
+      if (!saved) {
+        return CONFIG.DEFAULT_MODE;
+      }
+
+      if (saved === "extraction") {
+        return "salvage";
+      }
+
+      return CONFIG.AVAILABLE_MODES.includes(saved)
+        ? saved
+        : CONFIG.DEFAULT_MODE;
+    },
+
+    setMode(mode) {
+      const normalized = CONFIG.AVAILABLE_MODES.includes(mode)
+        ? mode
+        : CONFIG.DEFAULT_MODE;
+
+      window.localStorage.setItem(Storage.getModeKey(), normalized);
       return normalized;
     },
 
@@ -878,6 +961,164 @@ const ALLOWED_ITEM_TYPES = [
     },
   };
 
+  const SalvageApi = {
+    clickNode(node) {
+      if (!node) return false;
+      const eventInit = { bubbles: true, cancelable: true };
+      node.dispatchEvent(new MouseEvent("mousedown", eventInit));
+      node.dispatchEvent(new MouseEvent("mouseup", eventInit));
+      node.dispatchEvent(new MouseEvent("click", eventInit));
+      return true;
+    },
+
+    async waitForRemovedCount(itemIds = [], attempts = 12, delay = 110) {
+      let removedCount = 0;
+      for (let attempt = 0; attempt < attempts; attempt += 1) {
+        await Utils.sleep(delay);
+        removedCount = itemIds.reduce(
+          (acc, id) => acc + (Engine.items.getItemById(id) ? 0 : 1),
+          0
+        );
+        if (removedCount > 0) break;
+      }
+      return removedCount;
+    },
+
+    async runDirectSalvageBatch(itemIds = []) {
+      const availableItemIds = itemIds.filter((itemId) =>
+        Boolean(Engine.items.getItemById(itemId))
+      );
+      if (availableItemIds.length === 0) return 0;
+      if (typeof _g !== "function") return 0;
+
+      const selectedItems = availableItemIds.join(",");
+
+      await new Promise((resolve) => {
+        _g(`salvager&action=salvage&selectedItems=${selectedItems}`, () => {
+          resolve();
+        });
+      });
+
+      return SalvageApi.waitForRemovedCount(availableItemIds, 14, 90);
+    },
+
+    async submitAndConfirmSalvage() {
+      const submitButton =
+        document.querySelector(".salvage__submit .button.small.green") ||
+        document.querySelector(".salvage__submit .button");
+      if (!SalvageApi.clickNode(submitButton)) return false;
+
+      for (let attempt = 0; attempt < 12; attempt += 1) {
+        await Utils.sleep(80);
+        const confirmButton =
+          document.querySelector(
+            ".window-controlls .button.small.alert-accept-hotkey"
+          ) ||
+          document.querySelector(".window-controlls .alert-accept-hotkey");
+        if (!confirmButton) continue;
+        SalvageApi.clickNode(confirmButton);
+        return true;
+      }
+
+      return false;
+    },
+
+    async runUiSalvagePass(itemIds = []) {
+      const passItems = itemIds.filter((itemId) => Boolean(Engine.items.getItemById(itemId)));
+      if (passItems.length === 0) return 0;
+
+      const tabReady = await Ui.ensureCraftingModeTab();
+      if (!tabReady) return 0;
+
+      for (const itemId of passItems) {
+        const itemNode = document.querySelector(`.item-id-${itemId}`);
+        if (!itemNode) continue;
+        SalvageApi.clickNode(itemNode);
+        await Utils.sleep(95);
+      }
+
+      await Utils.sleep(230);
+
+      const confirmed = await SalvageApi.submitAndConfirmSalvage();
+      if (!confirmed) return 0;
+
+      const removedInPass = await SalvageApi.waitForRemovedCount(passItems, 16, 120);
+
+      for (let attempt = 0; attempt < 25; attempt += 1) {
+        await Utils.sleep(100);
+        const stillActive = document.querySelector(".salvage__submit .button.small.green");
+        if (!stillActive) break;
+      }
+
+      return removedInPass;
+    },
+
+    async salvageItemsBatchThroughUi(itemIds = []) {
+      const availableItemIds = itemIds.filter((itemId) =>
+        Boolean(Engine.items.getItemById(itemId))
+      );
+      if (availableItemIds.length === 0) return 0;
+
+      const directRemoved = await SalvageApi.runDirectSalvageBatch(
+        availableItemIds
+      );
+      if (directRemoved > 0) {
+        return directRemoved;
+      }
+
+      let removedTotal = 0;
+      let pendingItemIds = [...availableItemIds];
+      let noProgressPasses = 0;
+      let adaptiveChunkSize = Math.min(12, pendingItemIds.length);
+
+      for (let pass = 0; pass < 50; pass += 1) {
+        pendingItemIds = pendingItemIds.filter((id) => Boolean(Engine.items.getItemById(id)));
+        if (pendingItemIds.length === 0) break;
+
+        const currentChunkSize = Math.max(1, Math.min(adaptiveChunkSize, pendingItemIds.length));
+        const passItemIds = pendingItemIds.slice(0, currentChunkSize);
+        const removedInPass = await SalvageApi.runUiSalvagePass(passItemIds);
+
+        pendingItemIds = pendingItemIds.filter((id) => Boolean(Engine.items.getItemById(id)));
+        removedTotal += removedInPass;
+
+        if (removedInPass <= 0) {
+          noProgressPasses += 1;
+          adaptiveChunkSize = Math.max(1, Math.floor(currentChunkSize / 2));
+        } else {
+          noProgressPasses = 0;
+
+          if (removedInPass < passItemIds.length) {
+            adaptiveChunkSize = Math.max(1, Math.floor(currentChunkSize / 2));
+          } else if (currentChunkSize < 12) {
+            adaptiveChunkSize = Math.min(12, currentChunkSize + 1);
+          }
+        }
+
+        if (noProgressPasses >= 6) break;
+      }
+
+      pendingItemIds = pendingItemIds.filter((id) => Boolean(Engine.items.getItemById(id)));
+      if (pendingItemIds.length > 0) {
+        for (const itemId of pendingItemIds) {
+          if (!Engine.items.getItemById(itemId)) continue;
+
+          const removedSingle = await SalvageApi.runUiSalvagePass([itemId]);
+          removedTotal += removedSingle;
+
+          if (!Engine.items.getItemById(itemId)) {
+            continue;
+          }
+
+          const retryRemovedSingle = await SalvageApi.runUiSalvagePass([itemId]);
+          removedTotal += retryRemovedSingle;
+        }
+      }
+
+      return removedTotal;
+    },
+  };
+
   const Inventory = {
     isTruthyStatValue(value) {
       if (value === undefined || value === null) return false;
@@ -942,39 +1183,41 @@ const ALLOWED_ITEM_TYPES = [
           .join(" | ")
       );
 
-      const bindRaw = `${bindParts.join(" | ")} | ${allStatsText} | ${statsSerialized} | ${domBindText}`;
+      const bindText = `${bindParts.join(" | ")} | ${allStatsText} | ${domBindText}`;
+      const bindRaw = `${bindText} | ${statsSerialized}`;
 
-      const hasNegation = bindRaw.includes("niezwiaz") || bindRaw.includes("unbound");
+      const hasNegation =
+        bindText.includes("niezwiaz") || bindText.includes("unbound");
       const hasAnyBindKeyword =
-        bindRaw.includes("bind") ||
-        bindRaw.includes("bound") ||
-        bindRaw.includes("zwiaz") ||
-        bindRaw.includes("wiaze po") ||
-        bindRaw.includes("wiaze sie");
+        bindText.includes("bind") ||
+        bindText.includes("bound") ||
+        bindText.includes("zwiaz") ||
+        bindText.includes("wiaze po") ||
+        bindText.includes("wiaze sie");
 
       const isBindsByBind =
         !hasNegation &&
-        (bindRaw.includes("binds") ||
-          bindRaw.includes("wiaze po zalozeniu") ||
-          bindRaw.includes("wiaze po") ||
-          bindRaw.includes("wiaze sie po") ||
-          bindRaw.includes("bind on equip"));
+        (bindText.includes("binds") ||
+          bindText.includes("wiaze po zalozeniu") ||
+          bindText.includes("wiaze po") ||
+          bindText.includes("wiaze sie po") ||
+          bindText.includes("bind on equip"));
 
       const isSoulboundByBind =
         !hasNegation &&
-        (bindRaw.includes("soul") ||
-          bindRaw.includes("zwiazany z wlascicielem") ||
-          bindRaw.includes("zwiazany z graczem") ||
-          bindRaw.includes("bound to owner") ||
-          bindRaw.includes("ownerbound"));
+        (bindText.includes("soul") ||
+          bindText.includes("zwiazany z wlascicielem") ||
+          bindText.includes("zwiazany z graczem") ||
+          bindText.includes("bound to owner") ||
+          bindText.includes("ownerbound"));
 
       const isPermboundByBind =
         !hasNegation &&
-        (bindRaw.includes("perm") ||
-          bindRaw.includes("zwiazany na stale") ||
-          bindRaw.includes("zwiazany z wlascicielem na stale") ||
-          bindRaw.includes("bound forever") ||
-          bindRaw.includes("permanent bound"));
+        (bindText.includes("perm") ||
+          bindText.includes("zwiazany na stale") ||
+          bindText.includes("zwiazany z wlascicielem na stale") ||
+          bindText.includes("bound forever") ||
+          bindText.includes("permanent bound"));
 
       const isSoulboundByFlags = [
         stats.soulbound,
@@ -1025,14 +1268,6 @@ const ALLOWED_ITEM_TYPES = [
         Inventory.isExplicitFalseStatValue(value)
       );
 
-      const isUnknownBound =
-        !isSoulboundByBind &&
-        !isPermboundByBind &&
-        !isSoulboundByFlags &&
-        !isPermboundByFlags &&
-        !hasNegation &&
-        (isGenericBoundByFlags || bindRaw.includes("zwiaz") || bindRaw.includes("bound"));
-
       const isDefinitelyUnboundByText =
         hasNegation ||
         bindRaw.includes("brak wzmianki odnosnie wiazania") ||
@@ -1044,6 +1279,15 @@ const ALLOWED_ITEM_TYPES = [
 
       const isExplicitlySafeUnbound =
         isDefinitelyUnboundByText || hasExplicitUnboundFlags;
+
+      const isUnknownBound =
+        !isSoulboundByBind &&
+        !isPermboundByBind &&
+        !isSoulboundByFlags &&
+        !isPermboundByFlags &&
+        !hasNegation &&
+        !isExplicitlySafeUnbound &&
+        (isGenericBoundByFlags || bindText.includes("zwiaz") || bindText.includes("bound"));
 
       const isSoulbound = isSoulboundByBind || isSoulboundByFlags;
       const isPermbound = isPermboundByBind || isPermboundByFlags;
@@ -1108,7 +1352,10 @@ const ALLOWED_ITEM_TYPES = [
       const isUpgraded = Inventory.isAlreadyEnhanced(item);
 
       const bindState = Inventory.readBindState(item);
-      const boundSettings = state.boundSettings || CONFIG.DEFAULT_BOUND_SETTINGS;
+      const boundSettings =
+        state.boundSettings ||
+        Storage.getBoundSettings() ||
+        CONFIG.DEFAULT_BOUND_SETTINGS;
       const strictNoBoundMode =
         !boundSettings.allowSoulbound && !boundSettings.allowPermbound;
       const isHeroic = itemRarity === "heroic";
@@ -1163,6 +1410,10 @@ const ALLOWED_ITEM_TYPES = [
       }, []);
 
       return [...new Set(reagents)];
+    },
+
+    getItemsForSalvage() {
+      return Inventory.getReagents();
     },
 
     getFreeSlotsInfo() {
@@ -1341,6 +1592,52 @@ const ALLOWED_ITEM_TYPES = [
       .upgrader-crafting-window {
         display: none !important;
       }
+      .upgrader-crafting-window-offscreen {
+        position: fixed !important;
+        top: -9999px !important;
+        left: -9999px !important;
+        opacity: 0 !important;
+      }
+      .widget-button.widget-upgrader-addon {
+        cursor: pointer;
+        overflow: hidden;
+        background: linear-gradient(145deg, rgba(24, 32, 74, 0.96), rgba(43, 21, 84, 0.96)) !important;
+        border-color: rgba(111, 76, 198, 0.7) !important;
+      }
+      .widget-button.widget-upgrader-addon::before {
+        box-shadow: inset 0 0 1px 1px rgba(111, 76, 198, 0.7) !important;
+      }
+      .widget-button.widget-upgrader-addon .icon.upgrader-widget-icon {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        position: absolute !important;
+        top: 2px !important;
+        right: 2px !important;
+        bottom: 2px !important;
+        left: 2px !important;
+        margin: 0 !important;
+        box-sizing: border-box;
+        width: auto !important;
+        height: auto !important;
+        padding: 0;
+        overflow: hidden;
+        border-radius: 4px;
+        transform: none !important;
+        font-weight: 800;
+        font-size: 14px;
+        color: #ffffff;
+        background-image: url("https://micc.garmory-cdn.cloud/obrazki/npc/e2/trist2_wabicielka-1a.gif") !important;
+        background-repeat: no-repeat !important;
+        background-position: calc(50% + 2px) 50% !important;
+        background-size: 94% 94% !important;
+        background-origin: border-box !important;
+        background-clip: border-box !important;
+        image-rendering: auto;
+      }
+      .widget-button.widget-upgrader-addon.ui-draggable-dragging {
+        z-index: 1000 !important;
+      }
       .upgrader-launcher,
       .upgrader-launcher *,
       .upgrader-gui-panel,
@@ -1406,6 +1703,20 @@ const ALLOWED_ITEM_TYPES = [
             text-align: center;
             font-size: 10px;
             color: #b7c3dd;
+          }
+          .upgrader-launcher-mode {
+            margin-bottom: 6px;
+            text-align: center;
+            font-size: 10px;
+            font-weight: 800;
+            letter-spacing: 0.25px;
+            text-transform: uppercase;
+          }
+          .upgrader-launcher-mode--enhancement {
+            color: #8fd9ff;
+          }
+          .upgrader-launcher-mode--salvage {
+            color: #ffcf8b;
           }
           .upgrader-launcher-counter--good {
             color: #88d27a;
@@ -1579,6 +1890,81 @@ const ALLOWED_ITEM_TYPES = [
               border-radius: 6px;
               padding: 6px;
               background: rgba(255,255,255,0.02);
+            }
+            .upgrader-mode-wrap {
+              margin-top: 6px;
+              border: 1px solid rgba(91,140,255,0.22);
+              border-radius: 8px;
+              padding: 8px;
+              background: linear-gradient(180deg, rgba(91,140,255,0.08), rgba(168,85,247,0.05));
+            }
+            .upgrader-mode-row {
+              display: flex;
+              align-items: center;
+              justify-content: space-between;
+              gap: 10px;
+            }
+            .upgrader-mode-label {
+              font-size: 12px;
+              font-weight: 800;
+              color: #dbe7ff;
+              letter-spacing: 0.2px;
+            }
+            .upgrader-mode-value {
+              display: inline-flex;
+              align-items: center;
+              justify-content: center;
+              min-width: 96px;
+              font-size: 11px;
+              font-weight: 800;
+              text-transform: uppercase;
+            }
+            .upgrader-mode-value--enhancement {
+              color: #8fd9ff;
+            }
+            .upgrader-mode-value--salvage {
+              color: #ffcf8b;
+            }
+            .upgrader-mode-switch {
+              position: relative;
+              display: inline-flex;
+              width: 46px;
+              height: 24px;
+              cursor: pointer;
+            }
+            .upgrader-mode-switch input {
+              opacity: 0;
+              width: 0;
+              height: 0;
+            }
+            .upgrader-mode-slider {
+              position: absolute;
+              inset: 0;
+              border-radius: 24px;
+              border: 1px solid rgba(91,140,255,0.35);
+              background: rgba(91,140,255,0.25);
+              box-sizing: border-box;
+              overflow: hidden;
+              transition: background 0.2s ease, border-color 0.2s ease;
+            }
+            .upgrader-mode-slider::before {
+              content: "";
+              position: absolute;
+              width: 18px;
+              height: 18px;
+              left: 2px;
+              top: 2px;
+              border-radius: 50%;
+              background: #f7fbff;
+              box-shadow: 0 1px 4px rgba(0,0,0,0.28);
+              transition: transform 0.2s ease;
+            }
+            .upgrader-mode-switch input:checked + .upgrader-mode-slider {
+              background: rgba(245,158,11,0.35);
+              border-color: rgba(245,158,11,0.6);
+            }
+            .upgrader-mode-switch input:checked + .upgrader-mode-slider::before {
+              transform: translateX(14px);
             }
             .upgrader-gui-rarity-title {
               font-size: 12px;
@@ -1761,27 +2147,81 @@ const ALLOWED_ITEM_TYPES = [
 
     prepareEnhancementWindow() {
       const wasOpenBeforeRun = Ui.isCraftingWindowOpen();
+      const hideCssClass =
+        state.mode === "salvage" ? null : "upgrader-crafting-window";
 
       if (!wasOpenBeforeRun) {
-        Engine.crafting.window.wnd.$.addClass("upgrader-crafting-window");
+        if (hideCssClass) {
+          Engine.crafting.window.wnd.$.addClass(hideCssClass);
+        }
         Engine.interface.clickCrafting();
+      } else {
+        if (hideCssClass) {
+          Engine.crafting.window.wnd.$.addClass(hideCssClass);
+        }
       }
 
-      return { wasOpenBeforeRun };
+      Ui.ensureCraftingModeTab();
+
+      return { wasOpenBeforeRun, hideCssClass };
+    },
+
+    async ensureCraftingModeTab() {
+      if (state.mode !== "salvage") {
+        return true;
+      }
+
+      for (let attempt = 0; attempt < 8; attempt += 1) {
+        const salvageTab =
+          document.querySelector(
+            '.one-item-on-divide-list.crafting-recipe-in-list[data-tab-id="salvage"]'
+          ) ||
+          document.querySelector(
+            '.one-item-on-divide-list.crafting-recipe-in-list[data-tab-id="extraction"]'
+          );
+
+        if (!salvageTab) {
+          await Utils.sleep(80);
+          continue;
+        }
+
+        salvageTab.dispatchEvent(
+          new MouseEvent("mousedown", { bubbles: true, cancelable: true })
+        );
+        salvageTab.dispatchEvent(
+          new MouseEvent("mouseup", { bubbles: true, cancelable: true })
+        );
+        salvageTab.dispatchEvent(
+          new MouseEvent("click", { bubbles: true, cancelable: true })
+        );
+
+        await Utils.sleep(90);
+
+        const isActive =
+          salvageTab.classList.contains("active") ||
+          salvageTab.classList.contains("selected") ||
+          salvageTab.classList.contains("crafting-recipe-in-list-active") ||
+          salvageTab.getAttribute("aria-selected") === "true";
+
+        if (isActive) {
+          return true;
+        }
+      }
+
+      return false;
     },
 
     restoreEnhancementWindow(session = {}) {
       const wasOpenBeforeRun = Boolean(session?.wasOpenBeforeRun);
+      const hideCssClass = session?.hideCssClass || null;
 
-      if (!wasOpenBeforeRun) {
-        Engine.crafting.window.wnd.$.removeClass("upgrader-crafting-window");
-        if (Ui.isCraftingWindowOpen()) {
-          Engine.interface.clickCrafting();
-        }
-      } else {
-        Engine.crafting.window.wnd.$.removeClass("upgrader-crafting-window");
+      if (hideCssClass) {
+        Engine.crafting.window.wnd.$.removeClass(hideCssClass);
       }
 
+      if (!wasOpenBeforeRun && Ui.isCraftingWindowOpen()) {
+        Engine.interface.clickCrafting();
+      }
     },
 
     markItemAsUpgraded(prevId) {
@@ -1860,7 +2300,6 @@ const ALLOWED_ITEM_TYPES = [
       Storage.setUpgradedItemId("");
       Ui.markItemAsUpgraded(previousId);
       Ui.renderSelectedItemPreview();
-      message("Wyczyszczono wybrany przedmiot do ulepszania.");
     },
 
     refreshEnhanceCounter() {
@@ -1945,11 +2384,15 @@ const ALLOWED_ITEM_TYPES = [
           enabled: toggle.checked,
         });
 
+        const autoModeLabel = state.mode === "salvage" ? "rozbijanie" : "ulepszanie";
+        const autoModeLabelCapitalized =
+          state.mode === "salvage" ? "Auto rozbijanie" : "Auto ulepszanie";
+
         Ui.renderAutoSettings();
         message(
           state.autoSettings.enabled
-            ? `Auto ulepszanie włączone (próg: ${state.autoSettings.minFreeSlots} wolnych slotów)`
-            : "Auto ulepszanie wyłączone"
+            ? `${autoModeLabelCapitalized} włączone (próg: ${state.autoSettings.minFreeSlots} wolnych slotów)`
+            : `${autoModeLabelCapitalized} wyłączone`
         );
       });
 
@@ -1963,9 +2406,11 @@ const ALLOWED_ITEM_TYPES = [
           minFreeSlots: slider.value,
         });
 
+        const autoModeLabel = state.mode === "salvage" ? "rozbijania" : "ulepszania";
+
         Ui.renderAutoSettings();
         message(
-          `Zapisano próg auto-ulepszania: ${state.autoSettings.minFreeSlots} wolnych slotów`
+          `Zapisano próg auto-${autoModeLabel}: ${state.autoSettings.minFreeSlots} wolnych slotów`
         );
       });
     },
@@ -1990,20 +2435,6 @@ const ALLOWED_ITEM_TYPES = [
           allowSoulbound: soulboundToggle.checked,
           allowPermbound: permboundToggle.checked,
         });
-
-        const enabled = [];
-        if (state.boundSettings.allowSoulbound) {
-          enabled.push("przedmioty związane z właścicielem");
-        }
-        if (state.boundSettings.allowPermbound) {
-          enabled.push("przedmioty związane na stałe");
-        }
-
-        message(
-          enabled.length > 0
-            ? `Dozwolone boundy reagentów: ${enabled.join(", ")}`
-            : "Boundy reagentów zablokowane (bezpieczny tryb)"
-        );
       };
 
       soulboundToggle.addEventListener("change", update);
@@ -2041,6 +2472,7 @@ const ALLOWED_ITEM_TYPES = [
         input.className = "upgrader-rarity-checkbox";
         input.value = rarity;
         input.checked = selectedRarities.includes(rarity);
+        input.disabled = state.mode === "salvage" && rarity === "heroic";
 
         const span = document.createElement("span");
   span.textContent = rarityMeta[rarity]?.label || rarity;
@@ -2052,6 +2484,90 @@ const ALLOWED_ITEM_TYPES = [
       });
     },
 
+    enforceSafeRaritiesForMode(showMessage = false) {
+      if (state.mode !== "salvage") {
+        return;
+      }
+
+      const selected = Storage.getAllowedRarities();
+      if (!selected.includes("heroic")) {
+        return;
+      }
+
+      const withoutHeroic = selected.filter((rarity) => rarity !== "heroic");
+      Storage.setAllowedRarities(withoutHeroic);
+
+      if (showMessage) {
+        message("W trybie rozbijania heroiki są automatycznie wyłączone.");
+      }
+    },
+
+    renderModeSwitch() {
+      const modeToggle = document.getElementById("upgrader-mode-toggle");
+      const modeValue = document.getElementById("upgrader-mode-value");
+      if (!modeToggle || !modeValue) return;
+
+      const isSalvage = state.mode === "salvage";
+      modeToggle.checked = isSalvage;
+      modeValue.textContent = isSalvage ? "ROZBIJANIE" : "ULEPSZANIE";
+      modeValue.className = `upgrader-mode-value ${
+        isSalvage
+          ? "upgrader-mode-value--salvage"
+          : "upgrader-mode-value--enhancement"
+      }`;
+    },
+
+    renderModeDependentTexts() {
+      const manualButton = document.getElementById("upgrader-launcher-enhance-btn");
+      const launcherMode = document.getElementById("upgrader-launcher-mode");
+      const hint = document.getElementById("upgrader-select-hint");
+      const autoLabel = document.getElementById("upgrader-auto-label");
+      const previewWrap = document.getElementById("upgrader-selected-preview-wrap");
+
+      const isSalvage = state.mode === "salvage";
+
+      if (manualButton) {
+        manualButton.textContent = isSalvage ? "ROZBIJ" : "ULEPSZ";
+      }
+
+      if (launcherMode) {
+        launcherMode.textContent = isSalvage ? "Tryb: rozbijanie" : "Tryb: ulepszanie";
+        launcherMode.className = `upgrader-launcher-mode ${
+          isSalvage
+            ? "upgrader-launcher-mode--salvage"
+            : "upgrader-launcher-mode--enhancement"
+        }`;
+      }
+
+      if (hint) {
+        hint.textContent = isSalvage
+          ? "Tryb rozbijania: addon użyje wybranych rzadkości i rozbije pasujące przedmioty."
+          : "Wybór przedmiotu: kliknij PPM na itemie i użyj opcji „Ulepsz ten przedmiot”.";
+      }
+
+      if (autoLabel) {
+        autoLabel.textContent = isSalvage ? "Auto rozbijanie" : "Auto ulepszanie";
+      }
+
+      if (previewWrap) {
+        previewWrap.style.display = isSalvage ? "none" : "block";
+      }
+    },
+
+    bindModeHandlers() {
+      const modeToggle = document.getElementById("upgrader-mode-toggle");
+      if (!modeToggle) return;
+
+      modeToggle.addEventListener("change", () => {
+        state.mode = Storage.setMode(modeToggle.checked ? "salvage" : "enhancement");
+        Ui.enforceSafeRaritiesForMode(true);
+        Ui.renderModeSwitch();
+        Ui.renderModeDependentTexts();
+        Ui.renderRarityOptions();
+
+      });
+    },
+
     getSelectedRaritiesFromGui() {
       const nodes = document.querySelectorAll(".upgrader-rarity-checkbox:checked");
       return [...nodes].map((node) => node.value);
@@ -2059,20 +2575,24 @@ const ALLOWED_ITEM_TYPES = [
 
     renderHotkeyInputs() {
       const enhanceInput = document.getElementById("upgrader-hotkey-enhance");
+      const salvageInput = document.getElementById("upgrader-hotkey-salvage");
       const guiInput = document.getElementById("upgrader-hotkey-gui");
-      if (!enhanceInput || !guiInput) return;
+      if (!enhanceInput || !salvageInput || !guiInput) return;
 
       const hotkeys = state.hotkeys || { ...CONFIG.DEFAULT_HOTKEYS };
       enhanceInput.value = hotkeys.enhance;
+      salvageInput.value = hotkeys.salvage;
       guiInput.value = hotkeys.gui;
     },
 
     getHotkeysFromGui() {
       const enhanceInput = document.getElementById("upgrader-hotkey-enhance");
+      const salvageInput = document.getElementById("upgrader-hotkey-salvage");
       const guiInput = document.getElementById("upgrader-hotkey-gui");
 
       return {
         enhance: enhanceInput?.value,
+        salvage: salvageInput?.value,
         gui: guiInput?.value,
       };
     },
@@ -2396,6 +2916,509 @@ const ALLOWED_ITEM_TYPES = [
       });
     },
 
+    getInterfaceWidgetHost() {
+      const strictHost =
+        document.querySelector(
+          ".top-left.main-buttons-container.static-widget-position"
+        ) ||
+        document.querySelector(
+          ".top-right.main-buttons-container.static-widget-position"
+        ) ||
+        document.querySelector(".top-left.main-buttons-container") ||
+        document.querySelector(".top-right.main-buttons-container");
+      if (strictHost) {
+        return strictHost;
+      }
+
+      const existingWidget =
+        document.querySelector(
+          ".widget-button.widget-world-icon.widget-in-interface-bar"
+        ) ||
+        document.querySelector(
+          ".widget-button.widget-vaddonz.widget-in-interface-bar"
+        ) ||
+        document.querySelector(
+          ".widget-button.widget-in-interface-bar"
+        );
+      if (existingWidget?.parentElement) {
+        return existingWidget.parentElement;
+      }
+
+      const hostSelectors = [
+        ".interface-bar",
+        ".widget-layer",
+        ".interface-layer",
+        ".left-interface",
+      ];
+
+      for (const selector of hostSelectors) {
+        const host = document.querySelector(selector);
+        if (host) return host;
+      }
+
+      return null;
+    },
+
+    bindInterfaceWidget(widgetButton) {
+      if (!widgetButton) return;
+      if (widgetButton.dataset.upgraderBound === "1") {
+        Ui.initInterfaceWidgetDraggable(widgetButton);
+        return;
+      }
+
+      widgetButton.dataset.upgraderBound = "1";
+
+      widgetButton.addEventListener("click", (event) => {
+        if (Ui.isInterfaceWidgetConfigMode(widgetButton)) {
+          return;
+        }
+
+        event.preventDefault();
+        Ui.toggleLauncherVisibility();
+      });
+
+      widgetButton.addEventListener("contextmenu", async (event) => {
+        if (Ui.isInterfaceWidgetConfigMode(widgetButton)) {
+          return;
+        }
+
+        event.preventDefault();
+        Ui.toggleLauncherVisibility();
+      });
+
+      Ui.initInterfaceWidgetDraggable(widgetButton);
+    },
+
+    isInterfaceWidgetConfigMode(widgetButton) {
+      if (!widgetButton) return false;
+
+      if (widgetButton.classList.contains("ui-draggable-dragging")) {
+        return true;
+      }
+
+      return !widgetButton.classList.contains("ui-draggable-disabled");
+    },
+
+    isGameInterfaceConfigModeActive() {
+      return Boolean(
+        document.querySelector(
+          ".interface-config, .interface-configuration, .configuration-window, .ui-widget-config"
+        )
+      );
+    },
+
+    persistInterfaceWidgetPlacement(widgetButton) {
+      const host = widgetButton?.parentElement;
+      if (!host) return;
+
+      const slotStep = Ui.getWidgetSlotStep();
+      const leftValue = Utils.toNumber(parseFloat(widgetButton.style.left), 0);
+      const slot = Math.max(0, Math.round(leftValue / slotStep));
+      const top = Ui.getWidgetTopForHost(host);
+      const widgetPos = host.classList.contains("top-right")
+        ? "top-right"
+        : "top-left";
+
+      const { occupiedIndices } = Ui.getOccupiedWidgetSlots(host, widgetButton);
+      const preferredIndex = Math.max(
+        0,
+        Math.floor(Utils.toNumber(widgetButton.getAttribute("widget-index"), slot))
+      );
+      const widgetIndex =
+        !occupiedIndices.has(preferredIndex) && preferredIndex >= 0
+          ? preferredIndex
+          : Ui.getFirstFreeInteger(occupiedIndices, slot, 500);
+
+      widgetButton.setAttribute("widget-pos", widgetPos);
+      widgetButton.setAttribute("widget-index", String(widgetIndex));
+      widgetButton.style.left = `${slot * slotStep}px`;
+      widgetButton.style.top = `${top}px`;
+
+      Storage.setWidgetSlot({
+        widgetPos,
+        slot,
+        widgetIndex,
+      });
+    },
+
+    syncInterfaceWidgetDragState(widgetButton) {
+      const jq = window.jQuery || window.$;
+      if (!jq || typeof jq.fn?.draggable !== "function") return;
+
+      const $widget = jq(widgetButton);
+      if (!$widget.data("ui-draggable")) return;
+
+      const configModeEnabled = Ui.isGameInterfaceConfigModeActive();
+      $widget.draggable("option", "disabled", !configModeEnabled);
+      widgetButton.classList.toggle("ui-draggable-disabled", !configModeEnabled);
+    },
+
+    initInterfaceWidgetDraggable(widgetButton) {
+      const jq = window.jQuery || window.$;
+      if (!jq || typeof jq.fn?.draggable !== "function") return;
+
+      const $widget = jq(widgetButton);
+      if (!$widget.data("ui-draggable")) {
+        $widget.draggable({
+          containment: "parent",
+          grid: [Ui.getWidgetSlotStep(), Ui.getWidgetSlotStep()],
+          scroll: false,
+          disabled: true,
+          start() {
+            widgetButton.classList.add("ui-draggable-dragging");
+          },
+          stop() {
+            widgetButton.classList.remove("ui-draggable-dragging");
+            Ui.persistInterfaceWidgetPlacement(widgetButton);
+          },
+        });
+      }
+
+      Ui.syncInterfaceWidgetDragState(widgetButton);
+
+      if (!state.interfaceWidgetDragObserver) {
+        state.interfaceWidgetDragObserver = new MutationObserver(() => {
+          const currentWidget = document.getElementById("upgrader-interface-widget");
+          if (currentWidget) {
+            Ui.syncInterfaceWidgetDragState(currentWidget);
+          }
+        });
+
+        state.interfaceWidgetDragObserver.observe(document.body, {
+          childList: true,
+          subtree: true,
+          attributes: true,
+          attributeFilter: ["class"],
+        });
+      }
+    },
+
+    extractUrlFromBackgroundImage(backgroundImageValue) {
+      const match = String(backgroundImageValue || "").match(/url\(["']?(.*?)["']?\)/i);
+      return match?.[1] || null;
+    },
+
+    parseBackgroundPosition(backgroundPositionValue) {
+      const normalized = String(backgroundPositionValue || "").trim();
+      if (!normalized) {
+        return { x: 0, y: 0 };
+      }
+
+      const parts = normalized.split(/\s+/);
+      const x = Utils.toNumber(parseFloat(parts[0]), 0);
+      const y = Utils.toNumber(parseFloat(parts[1]), 0);
+
+      return { x, y };
+    },
+
+    async setWidgetFaceIconFromOutfit() {
+      const widgetIcon = document.querySelector(
+        "#upgrader-interface-widget .icon.upgrader-widget-icon"
+      );
+      const outfitGraphic = document.querySelector(".outfit-wrapper .outfit-graphic");
+      if (!widgetIcon || !outfitGraphic) return false;
+
+      const computed = window.getComputedStyle(outfitGraphic);
+      const backgroundImage =
+        computed.backgroundImage || outfitGraphic.style.backgroundImage;
+      const backgroundPosition =
+        computed.backgroundPosition || outfitGraphic.style.backgroundPosition;
+
+      const imageUrl = Ui.extractUrlFromBackgroundImage(backgroundImage);
+      if (!imageUrl) return false;
+
+      const { x, y } = Ui.parseBackgroundPosition(backgroundPosition);
+
+      try {
+        const dataUrl = await new Promise((resolve, reject) => {
+          const image = new Image();
+          image.crossOrigin = "anonymous";
+          image.onload = () => {
+            try {
+              const canvas = document.createElement("canvas");
+              canvas.width = 32;
+              canvas.height = 32;
+              const context = canvas.getContext("2d");
+              if (!context) {
+                reject(new Error("no-canvas-context"));
+                return;
+              }
+
+              const sourceX = Math.max(0, Math.round(-x + 8));
+              const sourceY = Math.max(0, Math.round(-y + 2));
+              context.imageSmoothingEnabled = false;
+              context.drawImage(image, sourceX, sourceY, 16, 16, 0, 0, 32, 32);
+              resolve(canvas.toDataURL("image/png"));
+            } catch (error) {
+              reject(error);
+            }
+          };
+          image.onerror = () => reject(new Error("outfit-image-load-failed"));
+          image.src = imageUrl;
+        });
+
+        widgetIcon.textContent = "";
+        widgetIcon.style.backgroundImage = `url(${dataUrl})`;
+        widgetIcon.style.backgroundPosition = "calc(50% + 2px) 50%";
+        widgetIcon.style.backgroundSize = "94% 94%";
+        return true;
+      } catch (error) {
+        widgetIcon.textContent = "";
+        widgetIcon.style.backgroundImage = backgroundImage;
+        widgetIcon.style.backgroundPosition = "calc(50% + 10px) 50%";
+        widgetIcon.style.backgroundSize = "94% 94%";
+        return true;
+      }
+    },
+
+    ensureWidgetIconFromOutfit() {
+      let attempts = 0;
+
+      const trySetIcon = async () => {
+        attempts += 1;
+        const applied = await Ui.setWidgetFaceIconFromOutfit();
+        if (!applied && attempts < 25) {
+          setTimeout(trySetIcon, 300);
+        }
+      };
+
+      trySetIcon();
+    },
+
+    isInterfaceWidgetVisible(widgetButton) {
+      if (!widgetButton) return false;
+
+      const rect = widgetButton.getBoundingClientRect();
+      if (!rect || rect.width < 20 || rect.height < 20) return false;
+
+      const style = window.getComputedStyle(widgetButton);
+      if (
+        style.display === "none" ||
+        style.visibility === "hidden" ||
+        Utils.toNumber(parseFloat(style.opacity), 1) <= 0.05
+      ) {
+        return false;
+      }
+
+      return (
+        rect.right > 0 &&
+        rect.bottom > 0 &&
+        rect.left < window.innerWidth &&
+        rect.top < window.innerHeight
+      );
+    },
+
+    syncLauncherVisibility() {
+      const launcher = document.getElementById("upgrader-launcher");
+      if (!launcher) return;
+
+      const interfaceWidget = document.getElementById("upgrader-interface-widget");
+      const hasMountedWidget = Boolean(interfaceWidget);
+
+      if (!hasMountedWidget) {
+        state.launcherVisible = true;
+      }
+
+      launcher.style.display = state.launcherVisible ? "block" : "none";
+    },
+
+    toggleLauncherVisibility(forceVisible = null) {
+      const launcher = document.getElementById("upgrader-launcher");
+      if (!launcher) return;
+
+      const nextVisible =
+        typeof forceVisible === "boolean"
+          ? forceVisible
+          : launcher.style.display === "none";
+
+      state.launcherVisible = nextVisible;
+      Ui.syncLauncherVisibility();
+    },
+
+    mountInterfaceWidget() {
+      const existingWidget = document.getElementById("upgrader-interface-widget");
+      if (existingWidget) {
+        Ui.bindInterfaceWidget(existingWidget);
+
+        const existingHost = existingWidget.parentElement;
+        if (existingHost) {
+          const savedSlot = Storage.getWidgetSlot();
+          const placement = Ui.resolveInterfaceWidgetPlacement(
+            existingHost,
+            savedSlot,
+            existingWidget
+          );
+
+          existingWidget.setAttribute("widget-pos", placement.widgetPos);
+          existingWidget.setAttribute("widget-index", String(placement.widgetIndex));
+          existingWidget.style.left = `${placement.left}px`;
+          existingWidget.style.top = `${placement.top}px`;
+          Storage.setWidgetSlot(placement);
+        }
+
+        state.hasInterfaceWidget = true;
+        Ui.syncLauncherVisibility();
+        return true;
+      }
+
+      const host = Ui.getInterfaceWidgetHost();
+      if (!host) {
+        state.hasInterfaceWidget = false;
+        Ui.syncLauncherVisibility();
+        return false;
+      }
+
+      const savedSlot = Storage.getWidgetSlot();
+      const placement = Ui.resolveInterfaceWidgetPlacement(host, savedSlot, null);
+
+      const widgetButton = document.createElement("div");
+      widgetButton.id = "upgrader-interface-widget";
+      widgetButton.className =
+        "widget-button green widget-in-interface-bar widget-upgrader-addon widget-quickforge ui-draggable ui-draggable-handle ui-draggable-disabled";
+      widgetButton.setAttribute("widget-name", "upgrader-addon");
+      widgetButton.setAttribute("widget-pos", placement.widgetPos);
+      widgetButton.setAttribute("widget-index", String(placement.widgetIndex));
+      widgetButton.title = "QuickForge (LPM: panel, PPM: akcja)";
+      widgetButton.style.width = "44px";
+      widgetButton.style.height = "44px";
+      widgetButton.style.position = "absolute";
+      widgetButton.style.left = `${placement.left}px`;
+      widgetButton.style.top = `${placement.top}px`;
+
+      widgetButton.innerHTML = `
+        <div class="icon upgrader-widget-icon"></div>
+        <div class="red-notification interface-element-red-notification" style="display: none;"></div>
+        <div class="amount"></div>
+      `;
+
+      host.appendChild(widgetButton);
+      Ui.bindInterfaceWidget(widgetButton);
+      Storage.setWidgetSlot(placement);
+
+      state.hasInterfaceWidget = true;
+      Ui.syncLauncherVisibility();
+      return true;
+    },
+
+    getWidgetSlotStep() {
+      return 44;
+    },
+
+    getWidgetTopForHost(host) {
+      const siblings = [
+        ...host.querySelectorAll(".widget-button.widget-in-interface-bar"),
+      ];
+
+      for (const sibling of siblings) {
+        const siblingTop = Utils.toNumber(parseFloat(sibling.style.top), NaN);
+        if (Number.isFinite(siblingTop)) {
+          return Math.round(siblingTop);
+        }
+      }
+
+      return 0;
+    },
+
+    getOccupiedWidgetSlots(host, ignoredNode = null) {
+      const slotStep = Ui.getWidgetSlotStep();
+      const occupiedSlots = new Set();
+      const occupiedIndices = new Set();
+
+      const widgets = [
+        ...host.querySelectorAll(".widget-button.widget-in-interface-bar"),
+      ].filter((node) => node !== ignoredNode);
+
+      widgets.forEach((node) => {
+        const leftValue = Utils.toNumber(parseFloat(node.style.left), NaN);
+        if (Number.isFinite(leftValue) && leftValue >= 0) {
+          occupiedSlots.add(Math.round(leftValue / slotStep));
+        }
+
+        const widgetIndex = Utils.toNumber(node.getAttribute("widget-index"), NaN);
+        if (Number.isFinite(widgetIndex) && widgetIndex >= 0) {
+          occupiedIndices.add(Math.floor(widgetIndex));
+        }
+      });
+
+      return { occupiedSlots, occupiedIndices };
+    },
+
+    getFirstFreeInteger(occupiedSet, startAt = 0, maxScan = 300) {
+      const safeStart = Math.max(0, Math.floor(Utils.toNumber(startAt, 0)));
+
+      for (let value = safeStart; value <= maxScan; value += 1) {
+        if (!occupiedSet.has(value)) {
+          return value;
+        }
+      }
+
+      return maxScan + 1;
+    },
+
+    resolveInterfaceWidgetPlacement(host, savedSlot = null, ignoredNode = null) {
+      const widgetPos = host.classList.contains("top-right")
+        ? "top-right"
+        : "top-left";
+      const slotStep = Ui.getWidgetSlotStep();
+      const top = Ui.getWidgetTopForHost(host);
+      const { occupiedSlots, occupiedIndices } = Ui.getOccupiedWidgetSlots(
+        host,
+        ignoredNode
+      );
+
+      const savedForThisSide =
+        savedSlot && savedSlot.widgetPos === widgetPos ? savedSlot : null;
+
+      const preferredSlot = Number.isFinite(savedForThisSide?.slot)
+        ? Math.max(0, Math.floor(savedForThisSide.slot))
+        : null;
+      const preferredIndex = Number.isFinite(savedForThisSide?.widgetIndex)
+        ? Math.max(0, Math.floor(savedForThisSide.widgetIndex))
+        : null;
+
+      const slot =
+        preferredSlot !== null && !occupiedSlots.has(preferredSlot)
+          ? preferredSlot
+          : Ui.getFirstFreeInteger(occupiedSlots, 0, 300);
+
+      const widgetIndex =
+        preferredIndex !== null && !occupiedIndices.has(preferredIndex)
+          ? preferredIndex
+          : Ui.getFirstFreeInteger(occupiedIndices, slot, 500);
+
+      return {
+        widgetPos,
+        slot,
+        widgetIndex,
+        left: slot * slotStep,
+        top,
+      };
+    },
+
+    ensureInterfaceWidgetMounted() {
+      let attempts = 0;
+      const tryMount = () => {
+        attempts += 1;
+        const mounted = Ui.mountInterfaceWidget();
+        if (!mounted && attempts < 120) {
+          setTimeout(tryMount, 400);
+        }
+      };
+
+      tryMount();
+
+      const observer = new MutationObserver(() => {
+        if (!document.getElementById("upgrader-interface-widget")) {
+          Ui.mountInterfaceWidget();
+        }
+      });
+
+      observer.observe(document.body, {
+        childList: true,
+        subtree: true,
+      });
+    },
+
     bindLauncherButtons() {
       const configButton = document.getElementById("upgrader-launcher-config-btn");
       const manualButton = document.getElementById("upgrader-launcher-enhance-btn");
@@ -2406,7 +3429,7 @@ const ALLOWED_ITEM_TYPES = [
       });
 
       manualButton.addEventListener("click", async () => {
-        await Automation.enhanceSelectedItem();
+        await Automation.runPrimaryAction();
       });
     },
 
@@ -2420,25 +3443,18 @@ const ALLOWED_ITEM_TYPES = [
           return;
         }
 
+        if (state.mode === "salvage" && target.value === "heroic" && target.checked) {
+          target.checked = false;
+          return;
+        }
+
         const selectedRarities = Ui.getSelectedRaritiesFromGui();
         if (selectedRarities.length === 0) {
           target.checked = true;
-          message("Wybierz co najmniej jedno rarity składników.");
           return;
         }
 
         Storage.setAllowedRarities(selectedRarities);
-        const rarityLabels = {
-          common: "Zwyklaki",
-          unique: "Unikaty",
-          heroic: "Heroiki",
-        };
-        const selectedLabels = selectedRarities
-          .map((rarity) => rarityLabels[rarity])
-          .filter(Boolean)
-          .join("/");
-
-        message(`Wybrano rzadkość: ${selectedLabels}.`);
       });
     },
 
@@ -2450,6 +3466,9 @@ const ALLOWED_ITEM_TYPES = [
       panel.style.display = state.guiVisible ? "block" : "none";
 
       if (state.guiVisible) {
+        Ui.enforceSafeRaritiesForMode();
+        Ui.renderModeSwitch();
+        Ui.renderModeDependentTexts();
         Ui.applyPanelPosition();
         Ui.renderSelectedItemPreview();
         Ui.renderRarityOptions();
@@ -2470,6 +3489,7 @@ const ALLOWED_ITEM_TYPES = [
         <div id="upgrader-launcher-title" class="upgrader-launcher-title">QuickForge</div>
         <div id="upgrader-launcher-counter" class="upgrader-launcher-counter">Limit: --</div>
         <div id="upgrader-launcher-points" class="upgrader-launcher-points">Punkty dziś: 0</div>
+        <div id="upgrader-launcher-mode" class="upgrader-launcher-mode upgrader-launcher-mode--enhancement">Tryb: ulepszanie</div>
         <div class="upgrader-launcher-row">
           <button id="upgrader-launcher-config-btn" class="upgrader-launcher-btn">CONFIG</button>
           <button id="upgrader-launcher-enhance-btn" class="upgrader-launcher-btn">ULEPSZ</button>
@@ -2484,8 +3504,18 @@ const ALLOWED_ITEM_TYPES = [
           <span>QuickForge - ustawienia</span>
           <button id="upgrader-gui-close-btn" class="upgrader-gui-close-btn" type="button" aria-label="Zamknij panel">×</button>
         </div>
-        <div class="upgrader-select-hint">Wybór przedmiotu: kliknij PPM na itemie i użyj opcji „Ulepsz ten przedmiot”.</div>
-        <div class="upgrader-selected-preview-wrap">
+        <div class="upgrader-mode-wrap">
+          <div class="upgrader-mode-row">
+            <span class="upgrader-mode-label">Tryb działania</span>
+            <span id="upgrader-mode-value" class="upgrader-mode-value">ULEPSZANIE</span>
+            <label class="upgrader-mode-switch" for="upgrader-mode-toggle">
+              <input id="upgrader-mode-toggle" type="checkbox" />
+              <span class="upgrader-mode-slider"></span>
+            </label>
+          </div>
+        </div>
+        <div id="upgrader-select-hint" class="upgrader-select-hint">Wybór przedmiotu: kliknij PPM na itemie i użyj opcji „Ulepsz ten przedmiot”.</div>
+        <div id="upgrader-selected-preview-wrap" class="upgrader-selected-preview-wrap">
           <div class="upgrader-gui-rarity-title">Wybrany przedmiot:</div>
           <div id="upgrader-selected-preview-box" class="upgrader-selected-preview-box"></div>
           <div id="upgrader-selected-preview-text" class="upgrader-selected-preview-text">Brak wybranego przedmiotu</div>
@@ -2510,7 +3540,7 @@ const ALLOWED_ITEM_TYPES = [
         </div>
         <div class="upgrader-auto-wrap">
           <div class="upgrader-auto-row">
-            <label for="upgrader-auto-enabled">Auto ulepszanie</label>
+            <label id="upgrader-auto-label" for="upgrader-auto-enabled">Auto ulepszanie</label>
             <input id="upgrader-auto-enabled" type="checkbox" />
           </div>
           <div class="upgrader-auto-row">
@@ -2531,7 +3561,9 @@ const ALLOWED_ITEM_TYPES = [
           <div class="upgrader-hotkeys-grid">
             <div class="upgrader-hotkeys-label">Ulepszanie</div>
             <input id="upgrader-hotkey-enhance" maxlength="1" class="upgrader-hotkeys-input" />
-            <div class="upgrader-hotkeys-label">GUI (SHIFT+)</div>
+            <div class="upgrader-hotkeys-label">Rozbijanie</div>
+            <input id="upgrader-hotkey-salvage" maxlength="1" class="upgrader-hotkeys-input" />
+            <div class="upgrader-hotkeys-label">Ustawienia (SHIFT+)</div>
             <input id="upgrader-hotkey-gui" maxlength="1" class="upgrader-hotkeys-input" />
           </div>
         </div>
@@ -2553,9 +3585,11 @@ const ALLOWED_ITEM_TYPES = [
       Ui.initButtonDrag();
       Ui.initPanelDrag();
       Ui.bindLauncherButtons();
+      Ui.ensureInterfaceWidgetMounted();
       Ui.bindAutoSettingsHandlers();
       Ui.bindBoundSettingsHandlers();
       Ui.bindRarityAutoSaveHandlers();
+      Ui.bindModeHandlers();
 
       document
         .getElementById("upgrader-clear-btn")
@@ -2578,10 +3612,6 @@ const ALLOWED_ITEM_TYPES = [
           const savedHotkeys = Storage.setHotkeys(nextHotkeys);
           state.hotkeys = savedHotkeys;
           Ui.renderHotkeyInputs();
-
-          message(
-            `Zapisano skróty: ulepszanie [${savedHotkeys.enhance}], GUI [SHIFT+${savedHotkeys.gui}]`
-          );
         });
 
       const closeButton = document.getElementById("upgrader-gui-close-btn");
@@ -2598,6 +3628,10 @@ const ALLOWED_ITEM_TYPES = [
       }
 
       Ui.renderSelectedItemPreview();
+      Ui.enforceSafeRaritiesForMode();
+      Ui.renderModeSwitch();
+      Ui.renderModeDependentTexts();
+      Ui.renderRarityOptions();
       Ui.renderBoundSettings();
       Ui.renderAutoSettings();
       Ui.refreshEnhanceCounter();
@@ -2629,8 +3663,6 @@ const ALLOWED_ITEM_TYPES = [
                   Storage.setUpgradedItemId("");
                   Ui.markItemAsUpgraded(currentSelectedItemId);
                   Ui.renderSelectedItemPreview();
-
-                  message(`Anulowano ulepszanie przedmiotu ${item.name}`);
                 },
                 { button: { cls: "menu-item--red" } },
               ]
@@ -2640,8 +3672,6 @@ const ALLOWED_ITEM_TYPES = [
                   Storage.setUpgradedItemId(itemId);
                   Ui.markItemAsUpgraded(currentSelectedItemId);
                   Ui.renderSelectedItemPreview();
-
-                  message(`Ulepszanie przedmiotu ${item.name}`);
                 },
                 { button: { cls: "menu-item--yellow" } },
               ];
@@ -2653,6 +3683,123 @@ const ALLOWED_ITEM_TYPES = [
   };
 
   const Automation = {
+    async runPrimaryAction(options = {}) {
+      if (state.mode === "salvage") {
+        return Automation.salvageEligibleItems(options);
+      }
+
+      return Automation.enhanceSelectedItem(options);
+    },
+
+    async salvageEligibleItems(options = {}) {
+      const { silent = false } = options;
+
+      const result = {
+        status: "idle",
+        reachedLimit: false,
+        reachedMaxEnhancement: false,
+        itemName: null,
+      };
+
+      if (state.isEnhancing) {
+        result.status = "busy";
+        return result;
+      }
+
+      state.isEnhancing = true;
+
+      const items = Inventory.getItemsForSalvage();
+      if (items.length === 0) {
+        result.status = "missing-reagents";
+        if (!silent) {
+          message("Nie znaleziono przedmiotów do rozbijania.");
+        }
+        state.isEnhancing = false;
+        return result;
+      }
+
+      let enhancementSession = null;
+
+      try {
+        result.status = "running";
+        enhancementSession = Ui.prepareEnhancementWindow();
+        await Utils.sleep(150);
+        const switchedToSalvage = await Ui.ensureCraftingModeTab();
+
+        if (!switchedToSalvage) {
+          result.status = "failed";
+          if (!silent) {
+            message("Nie udało się przełączyć zakładki rzemiosła na rozbijanie.", "err");
+          }
+          return result;
+        }
+
+        let successCount = 0;
+        let noProgressRounds = 0;
+
+        for (let round = 0; round < 120; round += 1) {
+          const remainingItems = Inventory.getItemsForSalvage();
+          if (remainingItems.length === 0) {
+            break;
+          }
+
+          const batch = remainingItems.slice(0, CONFIG.MAX_REAGENTS);
+          if (batch.length === 0) {
+            break;
+          }
+
+          const firstBatchItem = Engine.items.getItemById(batch[0]);
+          const tabReady = await Ui.ensureCraftingModeTab();
+          if (!tabReady) {
+            break;
+          }
+
+          await Utils.sleep(200);
+
+          const batchResult = await SalvageApi.salvageItemsBatchThroughUi(batch);
+          if (batchResult > 0) {
+            successCount += batchResult;
+            noProgressRounds = 0;
+            result.itemName = firstBatchItem?.name || result.itemName;
+          } else {
+            noProgressRounds += 1;
+          }
+
+          if (noProgressRounds >= 4) {
+            break;
+          }
+
+          await Utils.sleep(320);
+        }
+
+        const remainingItems = Inventory.getItemsForSalvage().length;
+
+        if (successCount > 0) {
+          result.status = "done";
+          if (!silent) {
+            if (remainingItems > 0) {
+              message(
+                `Rozbito ${successCount} przedmiotów. Zostało ${remainingItems} pasujących — nie udało się ich już zaznaczyć/rozbić automatycznie.`,
+                "err"
+              );
+            } else {
+              message(`Rozbito ${successCount} przedmiotów.`);
+            }
+          }
+        } else {
+          result.status = "failed";
+          if (!silent) {
+            message("Nie udało się wykonać rozbijania (sprawdź aktywne okno rzemiosła).", "err");
+          }
+        }
+      } finally {
+        Ui.restoreEnhancementWindow(enhancementSession);
+        state.isEnhancing = false;
+      }
+
+      return result;
+    },
+
     async enhanceSelectedItem(options = {}) {
       const { silent = false } = options;
 
@@ -2766,7 +3913,6 @@ const ALLOWED_ITEM_TYPES = [
             return result;
           }
 
-          const previewPoints = Utils.getEnhancePreviewPoints();
           const enhanceItemResponse = await EnhancementApi.enhanceItem(
             upgradedItemId,
             reagentsToUse
@@ -2784,8 +3930,6 @@ const ALLOWED_ITEM_TYPES = [
           }
 
           const { count, limit } = enhanceItemResponse.enhancement.usages_preview;
-          const upgradeLevel =
-            enhanceItemResponse?.enhancement?.progressing?.upgradeLevel ?? "?";
 
           const parsedCount = Utils.toNumber(count, NaN);
           const parsedLimit = Utils.toNumber(limit, NaN);
@@ -2806,16 +3950,6 @@ const ALLOWED_ITEM_TYPES = [
           } else if (remainingToLimit !== null) {
             remainingToLimit = Math.max(0, remainingToLimit - reagentsToUse.length);
           }
-
-          message(
-            Utils.formatEnhanceProgressMessage({
-              itemName: upgradedItem.name,
-              count,
-              limit,
-              upgradeLevel,
-              points: previewPoints,
-            })
-          );
 
           await Utils.sleep(300);
         }
@@ -2852,7 +3986,7 @@ const ALLOWED_ITEM_TYPES = [
       }
 
       state.lastAutoTriggerAt = now;
-      const enhanceResult = await Automation.enhanceSelectedItem({ silent: true });
+      const enhanceResult = await Automation.runPrimaryAction({ silent: true });
 
       if (enhanceResult?.reachedLimit || enhanceResult?.reachedMaxEnhancement) {
         state.autoSettings = Storage.setAutoSettings({
@@ -2860,16 +3994,20 @@ const ALLOWED_ITEM_TYPES = [
           enabled: false,
         });
 
+        const autoModeLabelCapitalized =
+          state.mode === "salvage" ? "Auto rozbijanie" : "Auto ulepszanie";
+        const limitLabel = state.mode === "salvage" ? "rozbić" : "ulepszeń";
+
         const targetItemLabel = enhanceResult.itemName
           ? ` dla ${enhanceResult.itemName}`
           : "";
 
         if (enhanceResult?.reachedMaxEnhancement) {
           message(
-            `Auto ulepszanie wyłączone: przedmiot${targetItemLabel} jest już maksymalnie ulepszony.`
+            `${autoModeLabelCapitalized} wyłączone: przedmiot${targetItemLabel} jest już maksymalnie ulepszony.`
           );
         } else {
-          message(`Auto ulepszanie wyłączone: osiągnięto limit ulepszeń${targetItemLabel}.`);
+          message(`${autoModeLabelCapitalized} wyłączone: osiągnięto limit ${limitLabel}${targetItemLabel}.`);
         }
       }
 
@@ -2898,6 +4036,8 @@ const ALLOWED_ITEM_TYPES = [
 
         const key = String(event.key || "").toLowerCase();
         const hotkeys = state.hotkeys || CONFIG.DEFAULT_HOTKEYS;
+        const activeActionHotkey =
+          state.mode === "salvage" ? hotkeys.salvage : hotkeys.enhance;
 
         if (event.shiftKey && key === hotkeys.gui) {
           event.preventDefault();
@@ -2905,8 +4045,8 @@ const ALLOWED_ITEM_TYPES = [
           return;
         }
 
-        if (key === hotkeys.enhance) {
-          await Automation.enhanceSelectedItem();
+        if (key === activeActionHotkey) {
+          await Automation.runPrimaryAction();
         }
       });
     },
@@ -2996,9 +4136,7 @@ const ALLOWED_ITEM_TYPES = [
                   );
                 }
               }
-            } catch (error) {
-              // ignore counter hook errors to not block game requests
-            }
+            } catch (error) {}
 
             return originalCallback.apply(this, callbackArgs);
           };
@@ -3028,8 +4166,17 @@ const ALLOWED_ITEM_TYPES = [
       state.hotkeys = Storage.getHotkeys();
       state.autoSettings = Storage.getAutoSettings();
       state.boundSettings = Storage.getBoundSettings();
+      state.mode = Storage.getMode();
       state.enhanceCounter = Storage.getEnhanceCounter();
       state.dailyEnhancePoints = Storage.getDailyEnhancePoints();
+
+      if (state.mode === "salvage") {
+        const selectedRarities = Storage.getAllowedRarities();
+        Storage.setAllowedRarities(
+          selectedRarities.filter((rarity) => rarity !== "heroic")
+        );
+      }
+
       Runtime.initEnhancementProgressHook();
       Ui.setupCss();
       Ui.createGui();
