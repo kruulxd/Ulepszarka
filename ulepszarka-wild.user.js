@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ulepszator by Kruul
 // @namespace    http://tampermonkey.net/
-// @version      0.1.6
+// @version      0.1.7
 // @description  Auto ulepszanie i rozbijanie
 // @author       Kruul
 // @match        https://*.margonem.pl/
@@ -112,8 +112,11 @@ const ALLOWED_ITEM_TYPES = [
     enhanceCounter: null,
     dailyEnhancePoints: CONFIG.DAILY_POINTS_DEFAULT,
     enhancementProgressHooked: false,
+    salvageMessageHooked: false,
     lastProgressEventKey: null,
     lastProgressEventAt: 0,
+    enhancementRunSummary: null,
+    salvageReceivedItems: [],
     isEnhancing: false,
     mode: CONFIG.DEFAULT_MODE,
     lastAutoTriggerAt: 0,
@@ -121,6 +124,8 @@ const ALLOWED_ITEM_TYPES = [
     hasInterfaceWidget: false,
     interfaceWidgetDragObserver: null,
     launcherVisible: false,
+    enhancementNotificationTimer: null,
+    salvageNotificationTimer: null,
   };
 
   const Utils = {
@@ -444,6 +449,10 @@ const ALLOWED_ITEM_TYPES = [
 
     getLegacyDailyEnhancePointsKey() {
       return `upgrader-daily-enhance-points-charId-${Engine.hero.d.id}`;
+    },
+
+    getLauncherVisibilityKey() {
+      return `upgrader-launcher-visible-charId-${Engine.hero.d.id}`;
     },
 
     getUpgradedItemId() {
@@ -922,6 +931,23 @@ const ALLOWED_ITEM_TYPES = [
 
       const current = Storage.getDailyEnhancePoints();
       return Storage.setDailyEnhancePoints(current + delta);
+    },
+
+    getLauncherVisibility() {
+      const saved = window.localStorage.getItem(Storage.getLauncherVisibilityKey());
+      if (saved === null) {
+        // Domyślnie launcher jest widoczny (pierwszy raz)
+        return true;
+      }
+      return saved === "true";
+    },
+
+    setLauncherVisibility(isVisible) {
+      window.localStorage.setItem(
+        Storage.getLauncherVisibilityKey(),
+        String(Boolean(isVisible))
+      );
+      return Boolean(isVisible);
     },
   };
 
@@ -1647,7 +1673,7 @@ const ALLOWED_ITEM_TYPES = [
         font-family: "Segoe UI Variable", "Segoe UI", "Trebuchet MS", Tahoma, sans-serif !important;
       }
       .menu-item--yellow {
-        background: linear-gradient(90deg, #5b8cff, #a855f7) !important;
+        background: linear-gradient(90deg, #7c5caf, #a87ddc) !important;
         color: #fff !important;
         border-radius: 5px !important;
         padding: 5px !important;
@@ -1670,9 +1696,9 @@ const ALLOWED_ITEM_TYPES = [
             top: 150px;
             width: 146px;
             z-index: 12;
-            border: 1px solid rgba(91, 140, 255, 0.28);
+            border: 1px solid rgba(130, 75, 180, 0.4);
             border-radius: 10px;
-            background: linear-gradient(180deg, rgba(7,16,40,0.96), rgba(11,18,32,0.96));
+            background: linear-gradient(180deg, rgba(15,10,35,0.96), rgba(80,45,140,0.94));
             color: #e6eef8;
             cursor: url(https://pub-05e2f98fb5b34633ae42c4866ef64081.r2.dev/assets/img/cursor/1n.png), auto;
             font-weight: 700;
@@ -1689,7 +1715,7 @@ const ALLOWED_ITEM_TYPES = [
             text-transform: uppercase;
             text-align: center;
             cursor: move;
-            color: #a855f7;
+            color: #c4a0f7;
           }
           .upgrader-launcher-counter {
             margin-top: 4px;
@@ -1743,8 +1769,8 @@ const ALLOWED_ITEM_TYPES = [
             cursor: url(https://pub-05e2f98fb5b34633ae42c4866ef64081.r2.dev/assets/img/cursor/1n.png), auto;
           }
           .upgrader-launcher-btn:hover {
-            background: linear-gradient(90deg, rgba(91,140,255,0.25), rgba(168,85,247,0.25));
-            border-color: rgba(168,85,247,0.55);
+            background: linear-gradient(90deg, rgba(100,60,160,0.35), rgba(130,75,180,0.35));
+            border-color: rgba(130,75,180,0.6);
           }
           .upgrader-gui-panel {
             position: fixed;
@@ -1752,9 +1778,9 @@ const ALLOWED_ITEM_TYPES = [
             top: 188px;
             width: 260px;
             z-index: 11;
-            border: 1px solid rgba(91, 140, 255, 0.26);
+            border: 1px solid rgba(130, 75, 180, 0.35);
             border-radius: 12px;
-            background: linear-gradient(180deg, rgba(7,16,40,0.96), rgba(11,18,32,0.96));
+            background: linear-gradient(180deg, rgba(15,10,35,0.96), rgba(80,45,140,0.94));
             backdrop-filter: blur(2px);
             color: #e6eef8;
             padding: 8px;
@@ -1776,8 +1802,8 @@ const ALLOWED_ITEM_TYPES = [
             margin-bottom: 6px;
             cursor: move;
             padding: 3px 22px 3px 2px;
-            border-bottom: 1px solid rgba(91,140,255,0.22);
-            color: #a855f7;
+            border-bottom: 1px solid rgba(130,75,180,0.3);
+            color: #c4a0f7;
           }
           .upgrader-gui-close-btn {
             position: absolute;
@@ -1797,8 +1823,8 @@ const ALLOWED_ITEM_TYPES = [
             padding: 0;
           }
           .upgrader-gui-close-btn:hover {
-            background: linear-gradient(90deg, rgba(91,140,255,0.25), rgba(168,85,247,0.25));
-            border-color: rgba(168,85,247,0.55);
+            background: linear-gradient(90deg, rgba(100,60,160,0.35), rgba(130,75,180,0.35));
+            border-color: rgba(130,75,180,0.6);
           }
           .upgrader-gui-row {
             display: flex;
@@ -1820,8 +1846,8 @@ const ALLOWED_ITEM_TYPES = [
             font-weight: 700;
           }
           .upgrader-gui-btn:hover {
-            background: linear-gradient(90deg, rgba(91,140,255,0.25), rgba(168,85,247,0.25));
-            border-color: rgba(168,85,247,0.55);
+            background: linear-gradient(90deg, rgba(100,60,160,0.35), rgba(130,75,180,0.35));
+            border-color: rgba(130,75,180,0.6);
           }
             .upgrader-select-hint {
               margin-top: 6px;
@@ -1896,7 +1922,7 @@ const ALLOWED_ITEM_TYPES = [
               border: 1px solid rgba(91,140,255,0.22);
               border-radius: 8px;
               padding: 8px;
-              background: linear-gradient(180deg, rgba(91,140,255,0.08), rgba(168,85,247,0.05));
+              background: linear-gradient(180deg, rgba(100,60,160,0.1), rgba(130,75,180,0.08));
             }
             .upgrader-mode-row {
               display: flex;
@@ -3212,13 +3238,6 @@ const ALLOWED_ITEM_TYPES = [
       const launcher = document.getElementById("upgrader-launcher");
       if (!launcher) return;
 
-      const interfaceWidget = document.getElementById("upgrader-interface-widget");
-      const hasMountedWidget = Boolean(interfaceWidget);
-
-      if (!hasMountedWidget) {
-        state.launcherVisible = true;
-      }
-
       launcher.style.display = state.launcherVisible ? "block" : "none";
     },
 
@@ -3232,6 +3251,7 @@ const ALLOWED_ITEM_TYPES = [
           : launcher.style.display === "none";
 
       state.launcherVisible = nextVisible;
+      Storage.setLauncherVisibility(nextVisible);
       Ui.syncLauncherVisibility();
     },
 
@@ -3458,6 +3478,238 @@ const ALLOWED_ITEM_TYPES = [
       });
     },
 
+    getOrCreateAddonLikeTooltip() {
+      let tooltip = document.getElementById("upgrader-vaddonz-tooltip");
+      if (tooltip) {
+        return tooltip;
+      }
+
+      tooltip = document.createElement("div");
+      tooltip.id = "upgrader-vaddonz-tooltip";
+      tooltip.className = "vaddonz-tooltip-widget-vaddonz";
+      tooltip.style.display = "none";
+      tooltip.innerHTML = '<div class="content"><p></p></div>';
+      document.body.appendChild(tooltip);
+
+      return tooltip;
+    },
+
+    showAddonLikeTooltip(triggerNode) {
+      if (!triggerNode) return;
+
+      const text = String(
+        triggerNode.getAttribute("data-upgrader-tooltip") || ""
+      ).trim();
+      if (!text) return;
+
+      const tooltip = Ui.getOrCreateAddonLikeTooltip();
+      const paragraph = tooltip.querySelector(".content p");
+      if (paragraph) {
+        paragraph.textContent = text;
+      }
+
+      tooltip.style.display = "block";
+
+      const rect = triggerNode.getBoundingClientRect();
+      const viewportPadding = 8;
+      let left = Math.round(rect.left + window.scrollX);
+      let top = Math.round(rect.top + window.scrollY - tooltip.offsetHeight - 8);
+
+      if (left + tooltip.offsetWidth > window.scrollX + window.innerWidth - viewportPadding) {
+        left = Math.round(window.scrollX + window.innerWidth - tooltip.offsetWidth - viewportPadding);
+      }
+
+      if (left < window.scrollX + viewportPadding) {
+        left = Math.round(window.scrollX + viewportPadding);
+      }
+
+      if (top < window.scrollY + viewportPadding) {
+        top = Math.round(rect.bottom + window.scrollY + 8);
+      }
+
+      tooltip.style.left = `${left}px`;
+      tooltip.style.top = `${top}px`;
+    },
+
+    hideAddonLikeTooltip() {
+      const tooltip = document.getElementById("upgrader-vaddonz-tooltip");
+      if (!tooltip) return;
+      tooltip.style.display = "none";
+    },
+
+    bindTooltipHandlers() {
+      const triggers = document.querySelectorAll(
+        ".upgrader-tooltip-trigger[data-upgrader-tooltip]"
+      );
+
+      triggers.forEach((triggerNode) => {
+        if (triggerNode.dataset.upgraderTooltipBound === "1") {
+          return;
+        }
+
+        triggerNode.dataset.upgraderTooltipBound = "1";
+
+        triggerNode.addEventListener("mouseenter", () => {
+          Ui.showAddonLikeTooltip(triggerNode);
+        });
+
+        triggerNode.addEventListener("mousemove", () => {
+          Ui.showAddonLikeTooltip(triggerNode);
+        });
+
+        triggerNode.addEventListener("mouseleave", () => {
+          Ui.hideAddonLikeTooltip();
+        });
+      });
+    },
+
+    showEnhancementCompletionNotification(data) {
+      const notificationId = "upgrader-enhancement-notification";
+      let notification = document.getElementById(notificationId);
+
+      // Anuluj poprzedni timer jeśli istnieje
+      if (state.enhancementNotificationTimer) {
+        clearTimeout(state.enhancementNotificationTimer);
+        state.enhancementNotificationTimer = null;
+      }
+
+      if (!notification) {
+        notification = document.createElement("div");
+        notification.id = notificationId;
+        notification.style.cssText = `
+          position: fixed;
+          top: 30%;
+          left: 50%;
+          transform: translate(-50%, -50%) scale(0.9);
+          z-index: 99999;
+          min-width: 320px;
+          max-width: 420px;
+          padding: 24px 32px;
+          border-radius: 16px;
+          background: linear-gradient(135deg, rgba(15,10,35,0.98) 0%, rgba(80,45,140,0.96) 50%, rgba(130,75,180,0.95) 100%);
+          backdrop-filter: blur(10px);
+          box-shadow: 0 20px 60px rgba(80,45,140,0.6), 0 0 0 1px rgba(168,85,247,0.3), inset 0 1px 0 rgba(255,255,255,0.2);
+          color: #ffffff;
+          font-family: "Segoe UI Variable", "Segoe UI", "Trebuchet MS", Tahoma, sans-serif;
+          text-align: center;
+          pointer-events: none;
+          opacity: 0;
+          transition: all 0.4s cubic-bezier(0.34, 1.56, 0.64, 1);
+        `;
+        document.body.appendChild(notification);
+      }
+
+      // Resetuj stan powiadomienia
+      notification.style.opacity = "0";
+      notification.style.transform = "translate(-50%, -50%) scale(0.9)";
+
+      notification.innerHTML = `
+        <div style="font-size: 11px; font-weight: 600; letter-spacing: 2px; text-transform: uppercase; margin-bottom: 10px; opacity: 0.85; color: #e0e7ff;">
+          ✨ Ulepszono
+        </div>
+        <div style="font-size: 22px; font-weight: 900; margin-bottom: 12px; text-shadow: 0 3px 12px rgba(0,0,0,0.4); line-height: 1.2; letter-spacing: -0.5px;">
+          ${data.itemName}
+        </div>
+        <div style="display: inline-block; background: rgba(255,255,255,0.25); border-radius: 20px; padding: 6px 16px; margin-bottom: 14px; font-size: 16px; font-weight: 700; letter-spacing: 1px;">
+          ${data.level}
+        </div>
+        <div style="font-size: 14px; font-weight: 600; margin-bottom: 10px; opacity: 0.9; color: #e0e7ff;">
+          Limit: ${data.counter}
+        </div>
+        <div style="font-size: 26px; font-weight: 800; color: #fbbf24; text-shadow: 0 0 20px rgba(251,191,36,0.6), 0 3px 8px rgba(0,0,0,0.5); letter-spacing: 1px; margin-top: 8px;">
+          +${data.points}
+        </div>
+        <div style="font-size: 10px; font-weight: 600; margin-top: 8px; opacity: 0.75; color: #e0e7ff;">
+          punktów ulepszenia
+        </div>
+      `;
+
+      requestAnimationFrame(() => {
+        notification.style.opacity = "1";
+        notification.style.transform = "translate(-50%, -50%) scale(1)";
+      });
+
+      state.enhancementNotificationTimer = setTimeout(() => {
+        notification.style.opacity = "0";
+        notification.style.transform = "translate(-50%, -60%) scale(0.95)";
+        state.enhancementNotificationTimer = null;
+      }, 3500);
+    },
+
+    showSalvageCompletionNotification(data) {
+      const notificationId = "upgrader-salvage-notification";
+      let notification = document.getElementById(notificationId);
+
+      // Anuluj poprzedni timer jeśli istnieje
+      if (state.salvageNotificationTimer) {
+        clearTimeout(state.salvageNotificationTimer);
+        state.salvageNotificationTimer = null;
+      }
+
+      if (!notification) {
+        notification = document.createElement("div");
+        notification.id = notificationId;
+        notification.style.cssText = `
+          position: fixed;
+          top: 30%;
+          left: 50%;
+          transform: translate(-50%, -50%) scale(0.9);
+          z-index: 99999;
+          min-width: 320px;
+          max-width: 420px;
+          padding: 24px 32px;
+          border-radius: 16px;
+          background: linear-gradient(135deg, rgba(35,15,10,0.98) 0%, rgba(140,60,45,0.96) 50%, rgba(180,90,75,0.95) 100%);
+          backdrop-filter: blur(10px);
+          box-shadow: 0 20px 60px rgba(140,60,45,0.6), 0 0 0 1px rgba(247,120,85,0.3), inset 0 1px 0 rgba(255,255,255,0.2);
+          color: #ffffff;
+          font-family: "Segoe UI Variable", "Segoe UI", "Trebuchet MS", Tahoma, sans-serif;
+          text-align: center;
+          pointer-events: none;
+          opacity: 0;
+          transition: all 0.4s cubic-bezier(0.34, 1.56, 0.64, 1);
+        `;
+        document.body.appendChild(notification);
+      }
+
+      // Resetuj stan powiadomienia
+      notification.style.opacity = "0";
+      notification.style.transform = "translate(-50%, -50%) scale(0.9)";
+
+      const remainingInfo = data.remainingItems > 0 
+        ? `<div style="font-size: 13px; font-weight: 500; margin-top: 14px; opacity: 0.85; color: #ffd7cc; padding: 8px 16px; background: rgba(0,0,0,0.2); border-radius: 8px;">
+             ⚠️ Zostało ${data.remainingItems} przedmiotów<br/>
+             <span style="font-size: 11px; opacity: 0.8;">nie udało się ich już zaznaczyć</span>
+           </div>`
+        : `<div style="font-size: 13px; font-weight: 600; margin-top: 14px; opacity: 0.9; color: #a7f3d0;">
+             ✓ Wszystko rozbite pomyślnie!
+           </div>`;
+
+      notification.innerHTML = `
+        <div style="font-size: 11px; font-weight: 600; letter-spacing: 2px; text-transform: uppercase; margin-bottom: 10px; opacity: 0.85; color: #ffd7cc;">
+          🔨 Rozbijanie zakończone
+        </div>
+        <div style="font-size: 32px; font-weight: 900; margin-bottom: 14px; text-shadow: 0 3px 12px rgba(0,0,0,0.4); line-height: 1.2; letter-spacing: -0.5px; color: #fbbf24;">
+          ${data.count}
+        </div>
+        <div style="font-size: 16px; font-weight: 600; margin-bottom: 8px; opacity: 0.95; color: #ffd7cc;">
+          ${data.count === 1 ? 'przedmiot rozbity' : 'przedmiotów rozbitych'}
+        </div>
+        ${remainingInfo}
+      `;
+
+      requestAnimationFrame(() => {
+        notification.style.opacity = "1";
+        notification.style.transform = "translate(-50%, -50%) scale(1)";
+      });
+
+      state.salvageNotificationTimer = setTimeout(() => {
+        notification.style.opacity = "0";
+        notification.style.transform = "translate(-50%, -60%) scale(0.95)";
+        state.salvageNotificationTimer = null;
+      }, 3500);
+    },
+
     toggleGui() {
       const panel = document.getElementById("upgrader-gui-panel");
       if (!panel) return;
@@ -3586,10 +3838,12 @@ const ALLOWED_ITEM_TYPES = [
       Ui.initPanelDrag();
       Ui.bindLauncherButtons();
       Ui.ensureInterfaceWidgetMounted();
+      Ui.syncLauncherVisibility();
       Ui.bindAutoSettingsHandlers();
       Ui.bindBoundSettingsHandlers();
       Ui.bindRarityAutoSaveHandlers();
       Ui.bindModeHandlers();
+      Ui.bindTooltipHandlers();
 
       document
         .getElementById("upgrader-clear-btn")
@@ -3722,6 +3976,7 @@ const ALLOWED_ITEM_TYPES = [
 
       try {
         result.status = "running";
+        state.salvageReceivedItems = [];
         enhancementSession = Ui.prepareEnhancementWindow();
         await Utils.sleep(150);
         const switchedToSalvage = await Ui.ensureCraftingModeTab();
@@ -3777,14 +4032,11 @@ const ALLOWED_ITEM_TYPES = [
         if (successCount > 0) {
           result.status = "done";
           if (!silent) {
-            if (remainingItems > 0) {
-              message(
-                `Rozbito ${successCount} przedmiotów. Zostało ${remainingItems} pasujących — nie udało się ich już zaznaczyć/rozbić automatycznie.`,
-                "err"
-              );
-            } else {
-              message(`Rozbito ${successCount} przedmiotów.`);
-            }
+            Ui.showSalvageCompletionNotification({
+              count: successCount,
+              remainingItems: remainingItems,
+              receivedItems: state.salvageReceivedItems
+            });
           }
         } else {
           result.status = "failed";
@@ -3793,6 +4045,7 @@ const ALLOWED_ITEM_TYPES = [
           }
         }
       } finally {
+        state.salvageReceivedItems = [];
         Ui.restoreEnhancementWindow(enhancementSession);
         state.isEnhancing = false;
       }
@@ -3844,6 +4097,11 @@ const ALLOWED_ITEM_TYPES = [
 
       try {
         result.status = "running";
+        state.enhancementRunSummary = {
+          itemName: upgradedItem?.name || null,
+          totalPoints: 0,
+          upgradeLevel: null,
+        };
         enhancementSession = Ui.prepareEnhancementWindow();
         const chunks = Utils.chunk(reagents, CONFIG.MAX_REAGENTS);
         const statusResponse = await EnhancementApi.setEnhancedItem(upgradedItemId);
@@ -3957,7 +4215,35 @@ const ALLOWED_ITEM_TYPES = [
         if (result.status !== "limit-reached") {
           result.status = "done";
         }
+
+        const enhancementRunSummary = state.enhancementRunSummary;
+        if (
+          !silent &&
+          enhancementRunSummary &&
+          enhancementRunSummary.totalPoints > 0
+        ) {
+          const levelValue = Utils.toNumber(
+            enhancementRunSummary.upgradeLevel,
+            NaN
+          );
+          const levelText = Number.isFinite(levelValue)
+            ? `+${levelValue}`
+            : "+?";
+
+          const counterSnapshot = Utils.getEnhanceCounterSnapshot();
+          const counterText = counterSnapshot
+            ? `${counterSnapshot.current}/${counterSnapshot.limit}`
+            : "--/--";
+
+          Ui.showEnhancementCompletionNotification({
+            itemName: enhancementRunSummary.itemName || "Przedmiot",
+            level: levelText,
+            counter: counterText,
+            points: Utils.formatPoints(enhancementRunSummary.totalPoints),
+          });
+        }
       } finally {
+        state.enhancementRunSummary = null;
         Ui.restoreEnhancementWindow(enhancementSession);
         state.isEnhancing = false;
         Ui.refreshEnhanceCounter();
@@ -4130,6 +4416,11 @@ const ALLOWED_ITEM_TYPES = [
                 state.dailyEnhancePoints = Storage.addDailyEnhancePoints(previewPoints);
                 Ui.refreshDailyEnhancePoints();
 
+                if (state.enhancementRunSummary) {
+                  state.enhancementRunSummary.totalPoints += previewPoints;
+                  state.enhancementRunSummary.upgradeLevel = progressLevel;
+                }
+
                 if (!state.isEnhancing) {
                   message(
                     `Dodano +${Utils.formatPoints(previewPoints)} pkt ulepszenia.`
@@ -4148,6 +4439,44 @@ const ALLOWED_ITEM_TYPES = [
       window._g[hookFlag] = true;
 
       state.enhancementProgressHooked = true;
+    },
+
+    initSalvageMessageHook() {
+      if (state.salvageMessageHooked) return;
+      if (typeof window.message !== "function") return;
+
+      const hookFlag = "__upgraderSalvageMessageHooked";
+      if (window.message && window.message[hookFlag]) {
+        state.salvageMessageHooked = true;
+        return;
+      }
+
+      const originalMessage = window.message;
+
+      window.message = function (...args) {
+        const text = String(args[0] || "");
+        const messageType = args[1];
+
+        // Całkowicie blokuj komunikaty "Otrzymano:" z rozbijania
+        if (text.startsWith("Otrzymano:")) {
+          // Wyciągnij nazwę przedmiotu (wszystko po "Otrzymano: ")
+          const itemText = text.replace(/^Otrzymano:\s*/, "").trim();
+          
+          // Zapisz przedmiot do tablicy jeśli jesteśmy w trakcie rozbijania
+          if (itemText && state.isEnhancing) {
+            state.salvageReceivedItems.push(itemText);
+          }
+          
+          // Nie wywołuj oryginalnego komunikatu - całkowicie zablokuj wyświetlanie
+          return;
+        }
+
+        // Dla pozostałych komunikatów wywołaj oryginalną funkcję
+        return originalMessage.apply(this, args);
+      };
+
+      window.message[hookFlag] = true;
+      state.salvageMessageHooked = true;
     },
   };
 
@@ -4169,6 +4498,7 @@ const ALLOWED_ITEM_TYPES = [
       state.mode = Storage.getMode();
       state.enhanceCounter = Storage.getEnhanceCounter();
       state.dailyEnhancePoints = Storage.getDailyEnhancePoints();
+      state.launcherVisible = Storage.getLauncherVisibility();
 
       if (state.mode === "salvage") {
         const selectedRarities = Storage.getAllowedRarities();
@@ -4178,6 +4508,7 @@ const ALLOWED_ITEM_TYPES = [
       }
 
       Runtime.initEnhancementProgressHook();
+      Runtime.initSalvageMessageHook();
       Ui.setupCss();
       Ui.createGui();
       Automation.bindHotkey();
