@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ulepszator by Kruul
 // @namespace    http://tampermonkey.net/
-// @version      0.1.7
+// @version      0.1.8
 // @description  Auto ulepszanie i rozbijanie
 // @author       Kruul
 // @match        https://*.margonem.pl/
@@ -3582,13 +3582,13 @@ const ALLOWED_ITEM_TYPES = [
           left: 50%;
           transform: translate(-50%, -50%) scale(0.9);
           z-index: 99999;
-          min-width: 320px;
-          max-width: 420px;
-          padding: 24px 32px;
-          border-radius: 16px;
-          background: linear-gradient(135deg, rgba(15,10,35,0.98) 0%, rgba(80,45,140,0.96) 50%, rgba(130,75,180,0.95) 100%);
-          backdrop-filter: blur(10px);
-          box-shadow: 0 20px 60px rgba(80,45,140,0.6), 0 0 0 1px rgba(168,85,247,0.3), inset 0 1px 0 rgba(255,255,255,0.2);
+          min-width: 160px;
+          max-width: 200px;
+          padding: 8px 12px;
+          border-radius: 8px;
+          background: rgba(30, 20, 60, 0.4);
+          backdrop-filter: blur(16px);
+          box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4), 0 0 0 1px rgba(168,85,247,0.2);
           color: #ffffff;
           font-family: "Segoe UI Variable", "Segoe UI", "Trebuchet MS", Tahoma, sans-serif;
           text-align: center;
@@ -3603,23 +3603,41 @@ const ALLOWED_ITEM_TYPES = [
       notification.style.opacity = "0";
       notification.style.transform = "translate(-50%, -50%) scale(0.9)";
 
+      // Pobierz grafikę przedmiotu
+      let itemIconHtml = '';
+      if (data.itemId) {
+        const sourceNode = document.querySelector(`.item-id-${data.itemId}`);
+        if (sourceNode) {
+          const sourceCanvas = sourceNode.querySelector("canvas.icon.canvas-icon");
+          if (sourceCanvas) {
+            const iconSrc = sourceCanvas.toDataURL("image/png");
+            itemIconHtml = `
+              <div style="display: inline-block; width: 32px; height: 32px; margin-bottom: 4px;">
+                <img src="${iconSrc}" alt="${data.itemName}" style="width: 100%; height: 100%; image-rendering: pixelated;" />
+              </div>
+            `;
+          }
+        }
+      }
+
       notification.innerHTML = `
-        <div style="font-size: 11px; font-weight: 600; letter-spacing: 2px; text-transform: uppercase; margin-bottom: 10px; opacity: 0.85; color: #e0e7ff;">
+        <div style="font-size: 8px; font-weight: 600; letter-spacing: 0.5px; text-transform: uppercase; margin-bottom: 4px; opacity: 0.75; color: #e0e7ff;">
           ✨ Ulepszono
         </div>
-        <div style="font-size: 22px; font-weight: 900; margin-bottom: 12px; text-shadow: 0 3px 12px rgba(0,0,0,0.4); line-height: 1.2; letter-spacing: -0.5px;">
+        ${itemIconHtml}
+        <div style="font-size: 12px; font-weight: 700; margin-bottom: 3px; text-shadow: 0 1px 4px rgba(0,0,0,0.5); line-height: 1.1;">
           ${data.itemName}
         </div>
-        <div style="display: inline-block; background: rgba(255,255,255,0.25); border-radius: 20px; padding: 6px 16px; margin-bottom: 14px; font-size: 16px; font-weight: 700; letter-spacing: 1px;">
+        <div style="display: inline-block; background: rgba(255,255,255,0.15); border-radius: 8px; padding: 2px 8px; margin-bottom: 4px; font-size: 11px; font-weight: 700;">
           ${data.level}
         </div>
-        <div style="font-size: 14px; font-weight: 600; margin-bottom: 10px; opacity: 0.9; color: #e0e7ff;">
+        <div style="font-size: 10px; font-weight: 600; margin-bottom: 3px; opacity: 0.8; color: #e0e7ff;">
           Limit: ${data.counter}
         </div>
-        <div style="font-size: 26px; font-weight: 800; color: #fbbf24; text-shadow: 0 0 20px rgba(251,191,36,0.6), 0 3px 8px rgba(0,0,0,0.5); letter-spacing: 1px; margin-top: 8px;">
+        <div style="font-size: 18px; font-weight: 800; color: #fbbf24; text-shadow: 0 0 12px rgba(251,191,36,0.6), 0 1px 4px rgba(0,0,0,0.5);">
           +${data.points}
         </div>
-        <div style="font-size: 10px; font-weight: 600; margin-top: 8px; opacity: 0.75; color: #e0e7ff;">
+        <div style="font-size: 7px; font-weight: 600; margin-top: 2px; opacity: 0.65; color: #e0e7ff;">
           punktów ulepszenia
         </div>
       `;
@@ -4098,6 +4116,7 @@ const ALLOWED_ITEM_TYPES = [
       try {
         result.status = "running";
         state.enhancementRunSummary = {
+          itemId: upgradedItemId,
           itemName: upgradedItem?.name || null,
           totalPoints: 0,
           upgradeLevel: null,
@@ -4236,6 +4255,7 @@ const ALLOWED_ITEM_TYPES = [
             : "--/--";
 
           Ui.showEnhancementCompletionNotification({
+            itemId: enhancementRunSummary.itemId,
             itemName: enhancementRunSummary.itemName || "Przedmiot",
             level: levelText,
             counter: counterText,
@@ -4272,7 +4292,7 @@ const ALLOWED_ITEM_TYPES = [
       }
 
       state.lastAutoTriggerAt = now;
-      const enhanceResult = await Automation.runPrimaryAction({ silent: true });
+      const enhanceResult = await Automation.runPrimaryAction({ silent: false });
 
       if (enhanceResult?.reachedLimit || enhanceResult?.reachedMaxEnhancement) {
         state.autoSettings = Storage.setAutoSettings({
