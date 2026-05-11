@@ -1695,10 +1695,10 @@ const ALLOWED_ITEM_TYPES = [
             right: 16px;
             top: 150px;
             width: 146px;
-            z-index: 12;
+            z-index: 99998;
             border: 1px solid rgba(130, 75, 180, 0.4);
             border-radius: 10px;
-            background: linear-gradient(180deg, rgba(15,10,35,0.96), rgba(80,45,140,0.94));
+            background: linear-gradient(180deg, rgba(15,10,35,1), rgba(80,45,140,1));
             color: #e6eef8;
             cursor: url(https://pub-05e2f98fb5b34633ae42c4866ef64081.r2.dev/assets/img/cursor/1n.png), auto;
             font-weight: 700;
