@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ulepszator by Kruul
 // @namespace    http://tampermonkey.net/
-// @version      0.1.8
+// @version      0.1.9
 // @description  Auto ulepszanie i rozbijanie
 // @author       Kruul
 // @match        https://*.margonem.pl/
