@@ -2,7 +2,7 @@
 // @name         ulepszator by Kruul
 // @namespace    http://tampermonkey.net/
 // @version      0.2.2
-// @description  Auto ulepszanie przedmiotów
+// @description  Auto ulepszanie przedmiotów w Margonem (Quick Forge)
 // @author       Kruul
 // @match        https://*.margonem.pl/*
 // @updateURL    https://raw.githubusercontent.com/kruulxd/Ulepszarka/main/ulepszarka-wild.user.js
