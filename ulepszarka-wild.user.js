@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ulepszator by Kruul
 // @namespace    http://tampermonkey.net/
-// @version      0.2.2
+// @version      0.2.3
 // @description  Auto ulepszanie przedmiotów w Margonem (Quick Forge)
 // @author       Kruul
 // @match        https://*.margonem.pl/*
@@ -60,6 +60,7 @@ const CONFIG = {
   DAILY_RESET_TIME_ZONE: "Europe/Warsaw",
   BOOTSTRAP_MAX_ATTEMPTS: 120,
   BIND_STATE_CACHE_TTL_MS: 4000,
+  AUTO_BACKOFF_MS: 30000,
   DEFAULT_UI_SCALE: 1,
   UI_SCALE_STEP: 0.1,
   DEFAULT_DENSITY: "compact",
@@ -109,6 +110,14 @@ const CL = {
   TELEPORTS: 32,
 };
 
+// Statusy przebiegu, po ktorych nie ma sensu natychmiast probowac ponownie.
+const AUTO_UNPRODUCTIVE_STATUSES = [
+  "missing-item",
+  "missing-reagents",
+  "api-error",
+  "busy",
+];
+
 const ALLOWED_ITEM_TYPES = [
   CL.ONE_HAND_WEAPON,
   CL.TWO_HAND_WEAPON,
@@ -143,6 +152,8 @@ const ALLOWED_ITEM_TYPES = [
     lastEnhanceProgress: null,
     progressPeekTimer: null,
     lastAutoTriggerAt: 0,
+    autoBackoffUntil: 0,
+    sawEmptySlotMarkers: false,
     viewportSize: null,
     hasInterfaceWidget: false,
     interfaceWidgetDragObserver: null,
@@ -1363,6 +1374,13 @@ const ALLOWED_ITEM_TYPES = [
       return [...new Set(reagents)];
     },
 
+    // Zwraca liczbe wolnych slotow albo null, gdy nie da sie jej ustalic.
+    //
+    // WAZNE: nigdy nie zgadujemy "0". Wczesniejsze heurystyki liczyly
+    // "wszystkie .item minus te z klasa item-id-*" - a gra renderuje wezly
+    // tylko dla ZAJETYCH slotow, wiec to z definicji dawalo 0. Przy wyborze
+    // minimum z kandydatow panel widzial 0 wolnych slotow non stop i
+    // auto-ulepszanie odpalalo sie w kolko.
     getFreeSlotsInfo() {
       const EXCLUDED_BAG_SLOT_SELECTOR = ".bag-4-slot";
       const EXCLUDED_BAG_SELECTOR = '[data-bag="26"]';
@@ -1372,7 +1390,13 @@ const ALLOWED_ITEM_TYPES = [
             node?.closest?.(EXCLUDED_BAG_SELECTOR)
         );
 
-      // 1. API gry jest autorytatywne - probujemy je jako pierwsze.
+      const countExcludedBagEmptySlots = () =>
+        [
+          ...document.querySelectorAll(`${EXCLUDED_BAG_SELECTOR} .item.empty`),
+          ...document.querySelectorAll(`${EXCLUDED_BAG_SELECTOR} .slot.empty`),
+        ].length;
+
+      // 1. API gry, jesli w ogole istnieje i zwraca sensowna liczbe.
       const readEngineFreeSlots = () => {
         const getter = window.Engine?.items?.getFreeSlots;
         if (typeof getter !== "function") return null;
@@ -1392,13 +1416,8 @@ const ALLOWED_ITEM_TYPES = [
       };
 
       const engineFreeSlots = readEngineFreeSlots();
-
       if (engineFreeSlots !== null) {
-        const excludedBagEmptySlots = [
-          ...document.querySelectorAll(`${EXCLUDED_BAG_SELECTOR} .item.empty`),
-          ...document.querySelectorAll(`${EXCLUDED_BAG_SELECTOR} .slot.empty`),
-        ].length;
-
+        const excludedBagEmptySlots = countExcludedBagEmptySlots();
         return {
           freeSlots: Math.max(0, engineFreeSlots - excludedBagEmptySlots),
           source: "Engine.items.getFreeSlots",
@@ -1406,117 +1425,27 @@ const ALLOWED_ITEM_TYPES = [
         };
       }
 
-      // 2. Fallback na DOM. Bierzemy MINIMUM, bo zawyzenie liczby wolnych slotow
-      //    powoduje, ze auto-ulepszanie nigdy sie nie odpali. Zanizenie jest
-      //    nieszkodliwe - najwyzej odpali sie troche wczesniej.
-      const candidates = [];
-      const addCandidate = (freeSlots, source, extra = {}) => {
-        if (typeof freeSlots !== "number" || !Number.isFinite(freeSlots)) return;
-        if (freeSlots < 0) return;
-        candidates.push({ freeSlots, source, ...extra });
-      };
-
-      const emptySelectors = [
-        ".inventory .item.empty",
-        ".inventory .slot.empty",
-        ".backpack .item.empty",
-        ".backpack .slot.empty",
-        ".bag .item.empty",
-        ".bag .slot.empty",
-        ".scroll-pane .item.empty",
-        ".scroll-pane .slot.empty",
+      // 2. Jawne znaczniki pustych slotow w DOM. Zeru ufamy dopiero wtedy, gdy
+      //    wiemy, ze gra takie znaczniki w ogole renderuje - inaczej "0 pustych
+      //    wezlow" znaczy tylko tyle, ze ten mechanizm tu nie wystepuje.
+      const emptyNodes = [
+        ...document.querySelectorAll(".item.empty, .slot.empty"),
       ];
 
-      const emptyCount = emptySelectors
-        .map(
-          (selector) =>
-            [...document.querySelectorAll(selector)].filter(
-              (node) => !isInExcludedBagSlot(node)
-            ).length
-        )
-        .reduce((sum, count) => sum + count, 0);
-
-      if (emptyCount > 0) {
-        addCandidate(emptyCount, "DOM .empty");
+      if (emptyNodes.length > 0) {
+        state.sawEmptySlotMarkers = true;
       }
 
-      const inventoryRoot =
-        document.querySelector(".inventory") ||
-        document.querySelector(".backpack") ||
-        document.querySelector(".bag") ||
-        document.querySelector(".scroll-pane");
-
-      if (inventoryRoot) {
-        let occupiedSlots = 0;
-        try {
-          occupiedSlots = Engine.items.fetchLocationItems("g").length;
-        } catch (error) {
-          occupiedSlots = 0;
-        }
-
-        const totalSlots = [
-          ...inventoryRoot.querySelectorAll(".item, .slot"),
-        ].filter((node) => !isInExcludedBagSlot(node)).length;
-
-        if (totalSlots > 0 && totalSlots >= occupiedSlots) {
-          addCandidate(totalSlots - occupiedSlots, "DOM total - occupied", {
-            totalSlots,
-            occupiedSlots,
-          });
-        }
-
-        const allItemNodes = [...inventoryRoot.querySelectorAll(".item")].filter(
+      if (state.sawEmptySlotMarkers) {
+        const freeSlots = emptyNodes.filter(
           (node) => !isInExcludedBagSlot(node)
-        );
-        const occupiedFromDom = allItemNodes.filter((node) => {
-          const className = typeof node.className === "string" ? node.className : "";
-          return /item-id-\d+/.test(className);
-        }).length;
+        ).length;
 
-        if (allItemNodes.length > 0 && allItemNodes.length >= occupiedFromDom) {
-          addCandidate(
-            allItemNodes.length - occupiedFromDom,
-            "DOM .item - .item-id-*",
-            {
-              totalSlots: allItemNodes.length,
-              occupiedSlots: occupiedFromDom,
-            }
-          );
-        }
+        return { freeSlots, source: "DOM .empty" };
       }
 
-      const scrollPane = document.querySelector(".scroll-pane");
-      if (scrollPane) {
-        const slotNodes = [...scrollPane.querySelectorAll(".item, .slot")].filter(
-          (node) => !isInExcludedBagSlot(node)
-        );
-
-        if (slotNodes.length > 0) {
-          const occupiedInScrollPane = slotNodes.filter((node) => {
-            const className = typeof node.className === "string" ? node.className : "";
-            return /item-id-\d+/.test(className);
-          }).length;
-
-          addCandidate(
-            slotNodes.length - occupiedInScrollPane,
-            "scroll-pane slots - item-id-*",
-            {
-              totalSlots: slotNodes.length,
-              occupiedSlots: occupiedInScrollPane,
-            }
-          );
-        }
-      }
-
-      if (candidates.length > 0) {
-        candidates.sort((a, b) => a.freeSlots - b.freeSlots);
-        return candidates[0];
-      }
-
-      return {
-        freeSlots: null,
-        source: "unknown",
-      };
+      // 3. Brak wiarygodnego zrodla - auto-ulepszanie po prostu sie nie odpali.
+      return { freeSlots: null, source: "brak zrodla" };
     },
 
     getFreeSlots() {
@@ -1633,7 +1562,7 @@ const ALLOWED_ITEM_TYPES = [
             --ql-w: 192px;
             --ql-w-open: 356px;
             --ql-icon: 38px;
-            --ql-track-h: 16px;
+            --ql-track-h: 18px;
             --ql-btn-h: 28px;
             --ql-card-pad: 8px;
             --ql-grip: 9px;
@@ -1665,7 +1594,7 @@ const ALLOWED_ITEM_TYPES = [
             --ql-w: 226px;
             --ql-w-open: 384px;
             --ql-icon: 46px;
-            --ql-track-h: 19px;
+            --ql-track-h: 21px;
             --ql-btn-h: 32px;
             --ql-card-pad: 10px;
           }
@@ -1831,10 +1760,11 @@ const ALLOWED_ITEM_TYPES = [
             display: flex;
             align-items: center;
             justify-content: center;
-            font-size: 9px;
-            font-weight: 700;
-            color: var(--ql-text);
-            text-shadow: 0 1px 2px rgba(0, 0, 0, 0.65);
+            font-size: 11px;
+            font-weight: 800;
+            letter-spacing: 0.2px;
+            color: #ffffff;
+            text-shadow: 0 1px 2px rgba(0, 0, 0, 0.9), 0 0 4px rgba(0, 0, 0, 0.65);
             padding: 0 4px;
             white-space: nowrap;
             overflow: hidden;
@@ -2740,8 +2670,8 @@ const ALLOWED_ITEM_TYPES = [
 
       info.textContent =
         freeSlots === null
-          ? "Wolne sloty: nie udało się odczytać"
-          : `Wolne sloty teraz: ${freeSlots}`;
+          ? `Wolne sloty: nie udało się odczytać (${freeSlotsInfo.source})`
+          : `Wolne sloty teraz: ${freeSlots} (${freeSlotsInfo.source})`;
     },
 
     bindAutoSettingsHandlers() {
@@ -4589,6 +4519,38 @@ const ALLOWED_ITEM_TYPES = [
         return;
       }
 
+      const now = Date.now();
+
+      // Po nieproduktywnym przebiegu odpoczywamy dluzej. Bez tego kazdy taki
+      // przebieg wracal po 2 sekundach i zasypywal czat komunikatami.
+      if (now < state.autoBackoffUntil) {
+        return;
+      }
+
+      if (now - state.lastAutoTriggerAt < 2000) {
+        return;
+      }
+
+      // Bez wybranego przedmiotu przebieg i tak skonczylby sie komunikatem
+      // "Wybierz przedmiot do ulepszenia" - a auto probowalo co 2 sekundy.
+      const upgradedItemId = Storage.getUpgradedItemId();
+      if (!upgradedItemId) {
+        return;
+      }
+
+      let upgradedItem = null;
+      try {
+        upgradedItem = Engine.items.getItemById(upgradedItemId);
+      } catch (error) {
+        upgradedItem = null;
+      }
+
+      // Przedmiot wybrany, ale nie ma go juz w plecaku (sprzedany, przeniesiony).
+      if (!upgradedItem) {
+        state.autoBackoffUntil = now + CONFIG.AUTO_BACKOFF_MS;
+        return;
+      }
+
       const freeSlots = Inventory.getFreeSlots();
       if (freeSlots === null) {
         return;
@@ -4598,13 +4560,26 @@ const ALLOWED_ITEM_TYPES = [
         return;
       }
 
-      const now = Date.now();
-      if (now - state.lastAutoTriggerAt < 2000) {
+      // Nie ma sensu uruchamiac przebiegu, ktory i tak skonczy sie komunikatem
+      // "brak skladnikow".
+      let reagentCount = 0;
+      try {
+        reagentCount = Inventory.getReagents().length;
+      } catch (error) {
+        reagentCount = 0;
+      }
+
+      if (reagentCount === 0) {
+        state.autoBackoffUntil = now + CONFIG.AUTO_BACKOFF_MS;
         return;
       }
 
       state.lastAutoTriggerAt = now;
       const enhanceResult = await Automation.runPrimaryAction({ silent: false });
+
+      if (AUTO_UNPRODUCTIVE_STATUSES.includes(enhanceResult?.status)) {
+        state.autoBackoffUntil = Date.now() + CONFIG.AUTO_BACKOFF_MS;
+      }
 
       if (enhanceResult?.reachedLimit || enhanceResult?.reachedMaxEnhancement) {
         state.autoSettings = Storage.setAutoSettings({
@@ -4624,7 +4599,9 @@ const ALLOWED_ITEM_TYPES = [
             `${autoModeLabelCapitalized} wyłączone: przedmiot${targetItemLabel} jest już maksymalnie ulepszony.`
           );
         } else {
-          message(`${autoModeLabelCapitalized} wyłączone: osiągnięto limit ${limitLabel}${targetItemLabel}.`);
+          message(
+            `${autoModeLabelCapitalized} wyłączone: osiągnięto limit ${limitLabel}${targetItemLabel}.`
+          );
         }
       }
 
