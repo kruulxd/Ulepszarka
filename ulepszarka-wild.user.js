@@ -1,12 +1,12 @@
 // ==UserScript==
 // @name         ulepszator by Kruul
 // @namespace    http://tampermonkey.net/
-// @version      0.2
-// @description  Auto ulepszanie
+// @version      0.2.1
+// @description  Auto ulepszanie przedmiotów w Margonem (Quick Forge)
 // @author       Kruul
-// @match        https://*.margonem.pl/
-// @updateURL    https://raw.githubusercontent.com/kruulxd/ulepszarka-demo/main/ulepszarka-wild.user.js
-// @downloadURL  https://raw.githubusercontent.com/kruulxd/ulepszarka-demo/main/ulepszarka-wild.user.js
+// @match        https://*.margonem.pl/*
+// @updateURL    https://raw.githubusercontent.com/kruulxd/Ulepszarka/main/ulepszarka-wild.user.js
+// @downloadURL  https://raw.githubusercontent.com/kruulxd/Ulepszarka/main/ulepszarka-wild.user.js
 // @grant        none
 // ==/UserScript==
 
@@ -57,6 +57,20 @@ const CONFIG = {
     allowPermbound: false,
   },
   DAILY_POINTS_DEFAULT: 0,
+  DAILY_RESET_TIME_ZONE: "Europe/Warsaw",
+  BOOTSTRAP_MAX_ATTEMPTS: 120,
+  BIND_STATE_CACHE_TTL_MS: 4000,
+  DEFAULT_UI_SCALE: 1,
+  DEFAULT_DENSITY: "compact",
+  UI_SCALE_RANGE: {
+    min: 0.7,
+    max: 1.8,
+  },
+  RARITY_FILTER_META: {
+    common: { label: "Zwyklaki", className: "upgrader-rarity-common" },
+    unique: { label: "Unikaty", className: "upgrader-rarity-unique" },
+    heroic: { label: "Heroiki", className: "upgrader-rarity-heroic" },
+  },
 };
 
 const CL = {
@@ -133,6 +147,12 @@ const ALLOWED_ITEM_TYPES = [
     interfaceWidgetDragObserver: null,
     launcherVisible: false,
     enhancementNotificationTimer: null,
+    uiScale: CONFIG.DEFAULT_UI_SCALE,
+    density: CONFIG.DEFAULT_DENSITY,
+    bindStateCache: new Map(),
+    pendingPreviewPoints: null,
+    popupMenuHooked: false,
+    upgradedLabelObserver: null,
   };
 
   const Utils = {
@@ -140,6 +160,16 @@ const ALLOWED_ITEM_TYPES = [
       return new Promise((resolve) => setTimeout(resolve, ms));
     },
 
+    nextFrame() {
+      return new Promise((resolve) => {
+        if (typeof requestAnimationFrame === "function") {
+          requestAnimationFrame(() => resolve());
+          return;
+        }
+
+        setTimeout(resolve, 16);
+      });
+    },
     chunk(array, chunkSize) {
       const chunks = [];
       for (let i = 0; i < array.length; i += chunkSize) {
@@ -187,13 +217,6 @@ const ALLOWED_ITEM_TYPES = [
         .replace(/[ąćęłńóśźż]/g, (char) => polishMap[char] || char)
         .normalize("NFD")
         .replace(/[\u0300-\u036f]/g, "");
-    },
-
-    truncateText(value, maxLength = 28) {
-      const text = String(value || "").trim();
-      if (!text) return "Przedmiot";
-      if (text.length <= maxLength) return text;
-      return `${text.slice(0, Math.max(0, maxLength - 1))}…`;
     },
 
     parseEnhanceCounter(rawText) {
@@ -270,25 +293,66 @@ const ALLOWED_ITEM_TYPES = [
       return points.toLocaleString("pl-PL");
     },
 
+    getZonedDateParts(timestamp) {
+      const date = new Date(timestamp);
+      if (Number.isNaN(date.getTime())) return null;
+
+      try {
+        const formatter = new Intl.DateTimeFormat("en-CA", {
+          timeZone: CONFIG.DAILY_RESET_TIME_ZONE,
+          year: "numeric",
+          month: "2-digit",
+          day: "2-digit",
+          hour: "2-digit",
+          minute: "2-digit",
+          hour12: false,
+        });
+
+        const parts = formatter.formatToParts(date).reduce((acc, part) => {
+          acc[part.type] = part.value;
+          return acc;
+        }, {});
+
+        const year = Utils.toNumber(parts.year, NaN);
+        const month = Utils.toNumber(parts.month, NaN);
+        const day = Utils.toNumber(parts.day, NaN);
+        const hour = Utils.toNumber(parts.hour === "24" ? "0" : parts.hour, NaN);
+        const minute = Utils.toNumber(parts.minute, NaN);
+
+        if ([year, month, day, hour, minute].some((value) => !Number.isFinite(value))) {
+          return null;
+        }
+
+        return { year, month, day, hour, minute };
+      } catch (error) {
+        // Brak wsparcia dla strefy czasowej — fallback na czas lokalny przeglądarki.
+        return {
+          year: date.getFullYear(),
+          month: date.getMonth() + 1,
+          day: date.getDate(),
+          hour: date.getHours(),
+          minute: date.getMinutes(),
+        };
+      }
+    },
+
     getDailyResetCycleKey(timestamp = Date.now()) {
-      const currentDate = new Date(timestamp);
-      if (Number.isNaN(currentDate.getTime())) return null;
+      const parts = Utils.getZonedDateParts(timestamp);
+      if (!parts) return null;
 
-      const resetDate = new Date(currentDate);
-      resetDate.setHours(
-        CONFIG.DAILY_RESET_TIME.hour,
-        CONFIG.DAILY_RESET_TIME.minute,
-        0,
-        0
-      );
+      const minutesOfDay = parts.hour * 60 + parts.minute;
+      const resetMinutes =
+        CONFIG.DAILY_RESET_TIME.hour * 60 + CONFIG.DAILY_RESET_TIME.minute;
 
-      if (currentDate < resetDate) {
-        resetDate.setDate(resetDate.getDate() - 1);
+      // Arytmetyka na czystej dacie w UTC — odporna na zmianę czasu letniego.
+      const cycleDate = new Date(Date.UTC(parts.year, parts.month - 1, parts.day));
+      if (minutesOfDay < resetMinutes) {
+        cycleDate.setUTCDate(cycleDate.getUTCDate() - 1);
       }
 
-      const year = resetDate.getFullYear();
-      const month = String(resetDate.getMonth() + 1).padStart(2, "0");
-      const day = String(resetDate.getDate()).padStart(2, "0");
+      const year = cycleDate.getUTCFullYear();
+      const month = String(cycleDate.getUTCMonth() + 1).padStart(2, "0");
+      const day = String(cycleDate.getUTCDate()).padStart(2, "0");
 
       return `${year}-${month}-${day}`;
     },
@@ -296,47 +360,33 @@ const ALLOWED_ITEM_TYPES = [
     hasMaxEnhancementState(payload) {
       if (!payload || typeof payload !== "object") return false;
 
+      const enhancement = payload?.enhancement;
+
+      // 1. Jawne flagi serwera — jedyny w pełni wiarygodny sygnał.
       const directFlags = [
-        payload?.enhancement?.isMax,
-        payload?.enhancement?.max,
-        payload?.enhancement?.maxed,
-        payload?.enhancement?.is_max,
-        payload?.enhancement?.is_maxed,
-        payload?.enhancement?.maxLevel,
-        payload?.enhancement?.max_level,
+        enhancement?.isMax,
+        enhancement?.max,
+        enhancement?.maxed,
+        enhancement?.is_max,
+        enhancement?.is_maxed,
+        enhancement?.maxLevel,
+        enhancement?.max_level,
       ];
 
       if (directFlags.some((value) => value === true)) {
         return true;
       }
 
-      const enhancement = payload?.enhancement;
-      const upgradeLevel = Utils.toNumber(
-        enhancement?.progressing?.upgradeLevel ??
-          enhancement?.progressing?.upgrade_level ??
-          enhancement?.upgradeLevel ??
-          enhancement?.upgrade_level,
-        NaN
-      );
-
-      const usageCount = Utils.toNumber(
-        enhancement?.usages_preview?.count ?? enhancement?.usage?.count,
-        NaN
-      );
-      const usageLimit = Utils.toNumber(
-        enhancement?.usages_preview?.limit ?? enhancement?.usage?.limit,
-        NaN
-      );
-
+      // 2. Komunikat tekstowy (max ulepszenie / prośba o wybór bonusu).
       const textProbe = Utils.normalizeText(
         JSON.stringify([
           payload?.error,
           payload?.msg,
           payload?.message,
           payload?.tip,
-          payload?.enhancement?.error,
-          payload?.enhancement?.msg,
-          payload?.enhancement?.message,
+          enhancement?.error,
+          enhancement?.msg,
+          enhancement?.message,
         ])
       );
 
@@ -345,77 +395,38 @@ const ALLOWED_ITEM_TYPES = [
         /(wybierz|wybor).*(bonus)/.test(textProbe) ||
         /(bonus).*(wybierz|wybor)/.test(textProbe);
 
-      const queue = [payload];
-      const seen = new Set();
-      let hasBonusArraySignal = false;
-      let hasLegendaryCostSignal = false;
-
-      while (queue.length > 0) {
-        const current = queue.shift();
-        if (!current || typeof current !== "object") continue;
-        if (seen.has(current)) continue;
-        seen.add(current);
-
-        if (Array.isArray(current)) {
-          if (current.length >= 3) {
-            const objectLikeCount = current.filter(
-              (entry) => entry && typeof entry === "object"
-            ).length;
-            if (objectLikeCount >= 2) {
-              hasBonusArraySignal = true;
-            }
-          }
-
-          current.forEach((entry) => queue.push(entry));
-          continue;
-        }
-
-        Object.entries(current).forEach(([rawKey, value]) => {
-          const key = Utils.normalizeText(rawKey);
-
-          if (
-            key.includes("bonus") &&
-            Array.isArray(value) &&
-            value.length >= 3
-          ) {
-            hasBonusArraySignal = true;
-          }
-
-          if (
-            (key.includes("legend") || key.includes("esenc")) &&
-            typeof value === "number" &&
-            value > 0
-          ) {
-            hasLegendaryCostSignal = true;
-          }
-
-          if (value && typeof value === "object") {
-            queue.push(value);
-          }
-        });
-      }
-
-      const looksLikeMaxLevelState =
-        hasBonusArraySignal &&
-        (hasLegendaryCostSignal || hasTextSignal || (Number.isFinite(upgradeLevel) && upgradeLevel >= 4));
-
-      const maxedByUsageCounter =
-        Number.isFinite(usageCount) &&
-        Number.isFinite(usageLimit) &&
-        usageLimit > 0 &&
-        usageCount >= usageLimit;
-
-      if (looksLikeMaxLevelState) {
+      if (hasTextSignal) {
         return true;
       }
 
-      if (maxedByUsageCounter && hasTextSignal) {
+      // 3. Poziom ulepszenia zrównany z jawnie podanym maksimum.
+      const upgradeLevel = Utils.toNumber(
+        enhancement?.progressing?.upgradeLevel ??
+          enhancement?.progressing?.upgrade_level ??
+          enhancement?.upgradeLevel ??
+          enhancement?.upgrade_level,
+        NaN
+      );
+
+      const maxUpgradeLevel = Utils.toNumber(
+        enhancement?.progressing?.maxUpgradeLevel ??
+          enhancement?.progressing?.max_upgrade_level ??
+          enhancement?.maxUpgradeLevel ??
+          enhancement?.max_upgrade_level,
+        NaN
+      );
+
+      if (
+        Number.isFinite(upgradeLevel) &&
+        Number.isFinite(maxUpgradeLevel) &&
+        maxUpgradeLevel > 0 &&
+        upgradeLevel >= maxUpgradeLevel
+      ) {
         return true;
       }
 
       return false;
     },
-
   };
 
   const Storage = {
@@ -465,6 +476,123 @@ const ALLOWED_ITEM_TYPES = [
 
     getLauncherVisibilityKey() {
       return `upgrader-launcher-visible-charId-${Engine.hero.d.id}`;
+    },
+
+    getUiScaleKey() {
+      return `upgrader-ui-scale-charId-${Engine.hero.d.id}`;
+    },
+
+    getUiScale() {
+      const saved = window.localStorage.getItem(Storage.getUiScaleKey());
+      if (saved === null) return CONFIG.DEFAULT_UI_SCALE;
+
+      return Utils.clamp(
+        Utils.toNumber(saved, CONFIG.DEFAULT_UI_SCALE),
+        CONFIG.UI_SCALE_RANGE.min,
+        CONFIG.UI_SCALE_RANGE.max
+      );
+    },
+
+    setUiScale(scale) {
+      const normalized = Utils.clamp(
+        Utils.toNumber(scale, CONFIG.DEFAULT_UI_SCALE),
+        CONFIG.UI_SCALE_RANGE.min,
+        CONFIG.UI_SCALE_RANGE.max
+      );
+
+      window.localStorage.setItem(
+        Storage.getUiScaleKey(),
+        String(Math.round(normalized * 100) / 100)
+      );
+
+      return Math.round(normalized * 100) / 100;
+    },
+
+    getDensityKey() {
+      return `upgrader-density-charId-${Engine.hero.d.id}`;
+    },
+
+    getDensity() {
+      const saved = window.localStorage.getItem(Storage.getDensityKey());
+      return saved === "cozy" || saved === "compact"
+        ? saved
+        : CONFIG.DEFAULT_DENSITY;
+    },
+
+    setDensity(density) {
+      const normalized = density === "cozy" ? "cozy" : "compact";
+      window.localStorage.setItem(Storage.getDensityKey(), normalized);
+      return normalized;
+    },
+
+    // Migracja kluczy per-postać na współdzielone + usunięcie wpisów z minionej doby.
+    // Trzymane osobno, żeby gettery pozostały czystymi odczytami.
+    cleanupStaleEntries() {
+      const currentCycleKey = Utils.getDailyResetCycleKey();
+
+      const dropIfStale = (key, legacyKey, readCycleKey) => {
+        [key, legacyKey].forEach((storageKey) => {
+          const raw = window.localStorage.getItem(storageKey);
+          if (!raw) return;
+
+          let cycleKey = null;
+          try {
+            cycleKey = readCycleKey(JSON.parse(raw));
+          } catch (error) {
+            cycleKey = null;
+          }
+
+          if (!cycleKey || !currentCycleKey || cycleKey !== currentCycleKey) {
+            window.localStorage.removeItem(storageKey);
+          }
+        });
+      };
+
+      dropIfStale(
+        Storage.getEnhanceCounterKey(),
+        Storage.getLegacyEnhanceCounterKey(),
+        (payload) => {
+          const savedAt = Utils.toNumber(payload?.savedAt, NaN);
+          return Number.isFinite(savedAt)
+            ? Utils.getDailyResetCycleKey(savedAt)
+            : null;
+        }
+      );
+
+      dropIfStale(
+        Storage.getDailyEnhancePointsKey(),
+        Storage.getLegacyDailyEnhancePointsKey(),
+        (payload) => {
+          const cycleKey = String(payload?.cycleKey || "").trim();
+          if (cycleKey) return cycleKey;
+
+          const savedAt = Utils.toNumber(payload?.savedAt, NaN);
+          return Number.isFinite(savedAt)
+            ? Utils.getDailyResetCycleKey(savedAt)
+            : null;
+        }
+      );
+
+      // Przeniesienie starych kluczy per-postać na klucze współdzielone.
+      const migrate = (sharedKey, legacyKey) => {
+        const legacyValue = window.localStorage.getItem(legacyKey);
+        if (!legacyValue) return;
+
+        if (!window.localStorage.getItem(sharedKey)) {
+          window.localStorage.setItem(sharedKey, legacyValue);
+        }
+
+        window.localStorage.removeItem(legacyKey);
+      };
+
+      migrate(
+        Storage.getEnhanceCounterKey(),
+        Storage.getLegacyEnhanceCounterKey()
+      );
+      migrate(
+        Storage.getDailyEnhancePointsKey(),
+        Storage.getLegacyDailyEnhancePointsKey()
+      );
     },
 
     getUpgradedItemId() {
@@ -717,12 +845,11 @@ const ALLOWED_ITEM_TYPES = [
       return normalized;
     },
 
+    // Czysty odczyt — sprzątaniem zajmuje się Storage.cleanupStaleEntries().
     getEnhanceCounter() {
-      const saved = window.localStorage.getItem(Storage.getEnhanceCounterKey());
-      const legacySaved = window.localStorage.getItem(
-        Storage.getLegacyEnhanceCounterKey()
-      );
-      const valueToRead = saved || legacySaved;
+      const valueToRead =
+        window.localStorage.getItem(Storage.getEnhanceCounterKey()) ||
+        window.localStorage.getItem(Storage.getLegacyEnhanceCounterKey());
       if (!valueToRead) return null;
 
       try {
@@ -730,31 +857,18 @@ const ALLOWED_ITEM_TYPES = [
         const savedText = String(parsedPayload?.text || "").trim();
         const savedAt = Utils.toNumber(parsedPayload?.savedAt, NaN);
 
-        if (!savedText || !Number.isFinite(savedAt)) {
-          window.localStorage.removeItem(Storage.getEnhanceCounterKey());
-          window.localStorage.removeItem(Storage.getLegacyEnhanceCounterKey());
-          return null;
-        }
+        if (!savedText || !Number.isFinite(savedAt)) return null;
 
         const currentCycleKey = Utils.getDailyResetCycleKey();
         const savedCycleKey = Utils.getDailyResetCycleKey(savedAt);
 
         if (!currentCycleKey || !savedCycleKey || currentCycleKey !== savedCycleKey) {
-          window.localStorage.removeItem(Storage.getEnhanceCounterKey());
-          window.localStorage.removeItem(Storage.getLegacyEnhanceCounterKey());
           return null;
         }
 
         const parsedCounter = Utils.parseEnhanceCounter(savedText);
-
-        if (parsedCounter && !saved && legacySaved) {
-          Storage.setEnhanceCounter(parsedCounter.text);
-        }
-
         return parsedCounter ? parsedCounter.text : null;
       } catch (error) {
-        window.localStorage.removeItem(Storage.getEnhanceCounterKey());
-        window.localStorage.removeItem(Storage.getLegacyEnhanceCounterKey());
         return null;
       }
     },
@@ -772,12 +886,11 @@ const ALLOWED_ITEM_TYPES = [
       );
     },
 
+    // Czysty odczyt — sprzątaniem zajmuje się Storage.cleanupStaleEntries().
     getDailyEnhancePoints() {
-      const saved = window.localStorage.getItem(Storage.getDailyEnhancePointsKey());
-      const legacySaved = window.localStorage.getItem(
-        Storage.getLegacyDailyEnhancePointsKey()
-      );
-      const valueToRead = saved || legacySaved;
+      const valueToRead =
+        window.localStorage.getItem(Storage.getDailyEnhancePointsKey()) ||
+        window.localStorage.getItem(Storage.getLegacyDailyEnhancePointsKey());
       if (!valueToRead) return CONFIG.DAILY_POINTS_DEFAULT;
 
       try {
@@ -787,39 +900,18 @@ const ALLOWED_ITEM_TYPES = [
         const payloadCycleKey = String(payload?.cycleKey || "").trim() || null;
         const currentCycleKey = Utils.getDailyResetCycleKey();
 
-        if (!currentCycleKey) {
-          window.localStorage.removeItem(Storage.getDailyEnhancePointsKey());
-          window.localStorage.removeItem(Storage.getLegacyDailyEnhancePointsKey());
+        if (!currentCycleKey) return CONFIG.DAILY_POINTS_DEFAULT;
+
+        const savedCycleKey =
+          payloadCycleKey ||
+          (Number.isFinite(savedAt) ? Utils.getDailyResetCycleKey(savedAt) : null);
+
+        if (!savedCycleKey || savedCycleKey !== currentCycleKey) {
           return CONFIG.DAILY_POINTS_DEFAULT;
-        }
-
-        let savedCycleKey = payloadCycleKey;
-        if (!savedCycleKey && Number.isFinite(savedAt)) {
-          savedCycleKey = Utils.getDailyResetCycleKey(savedAt);
-        }
-
-        if (!savedCycleKey) {
-          window.localStorage.removeItem(Storage.getDailyEnhancePointsKey());
-          window.localStorage.removeItem(Storage.getLegacyDailyEnhancePointsKey());
-          return CONFIG.DAILY_POINTS_DEFAULT;
-        }
-
-        if (!currentCycleKey || !savedCycleKey || currentCycleKey !== savedCycleKey) {
-          window.localStorage.removeItem(Storage.getDailyEnhancePointsKey());
-          window.localStorage.removeItem(Storage.getLegacyDailyEnhancePointsKey());
-          return CONFIG.DAILY_POINTS_DEFAULT;
-        }
-
-        if (!saved && legacySaved) {
-          Storage.setDailyEnhancePoints(points);
-        } else if (!payloadCycleKey) {
-          Storage.setDailyEnhancePoints(points);
         }
 
         return points;
       } catch (error) {
-        window.localStorage.removeItem(Storage.getDailyEnhancePointsKey());
-        window.localStorage.removeItem(Storage.getLegacyDailyEnhancePointsKey());
         return CONFIG.DAILY_POINTS_DEFAULT;
       }
     },
@@ -873,41 +965,60 @@ const ALLOWED_ITEM_TYPES = [
   };
 
   const EnhancementApi = {
-    setEnhancedItem(itemId) {
+    // _g nie zwraca Promise i potrafi nie zawołać callbacku — stąd timeout,
+    // inaczej await w pętli ulepszania mógłby wisieć w nieskończoność.
+    request(query, timeoutMs = 15000) {
       return new Promise((resolve) => {
-        _g(`enhancement&action=status&item=${itemId}`, (data) => {
+        let settled = false;
+
+        const finish = (data) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
           resolve(data);
-        });
+        };
+
+        const timer = setTimeout(() => finish(null), timeoutMs);
+
+        try {
+          _g(query, (data) => finish(data));
+        } catch (error) {
+          finish(null);
+        }
       });
+    },
+
+    setEnhancedItem(itemId) {
+      if (!itemId) return Promise.resolve(null);
+      return EnhancementApi.request(
+        `enhancement&action=status&item=${encodeURIComponent(itemId)}`
+      );
     },
 
     setReagents(itemId, reagentIds) {
-      const reagents = reagentIds.join(",");
-      return new Promise((resolve) => {
-        _g(
-          `enhancement&action=progress_preview&item=${itemId}&ingredients=${reagents}`,
-          (data) => {
-            resolve(data);
-          }
-        );
-      });
+      if (!itemId || !Array.isArray(reagentIds) || reagentIds.length === 0) {
+        return Promise.resolve(null);
+      }
+
+      return EnhancementApi.request(
+        `enhancement&action=progress_preview&item=${encodeURIComponent(
+          itemId
+        )}&ingredients=${reagentIds.join(",")}`
+      );
     },
 
     enhanceItem(itemId, reagentIds) {
-      if (!itemId || !reagentIds) return;
-      const reagents = reagentIds.join(",");
+      if (!itemId || !Array.isArray(reagentIds) || reagentIds.length === 0) {
+        return Promise.resolve(null);
+      }
 
-      return new Promise((resolve) => {
-        _g(
-          `enhancement&action=progress&item=${itemId}&ingredients=${reagents}`,
-          (data) => {
-            resolve(data);
-          }
-        );
-      });
+      return EnhancementApi.request(
+        `enhancement&action=progress&item=${encodeURIComponent(
+          itemId
+        )}&ingredients=${reagentIds.join(",")}`
+      );
     },
   };
-
 
   const Inventory = {
     isTruthyStatValue(value) {
@@ -934,9 +1045,45 @@ const ALLOWED_ITEM_TYPES = [
       );
     },
 
+    // Wyliczenie stanu zwiazania jest drogie (query DOM + JSON.stringify na kazdy
+    // przedmiot), a leci dla calego plecaka w petli odswiezania - stad krotki cache.
     readBindState(item) {
+      const itemId = item?.id;
+      if (itemId === undefined || itemId === null) {
+        return Inventory.computeBindState(item);
+      }
+
+      const cacheKey = String(itemId);
+      const now = Date.now();
+      const cached = state.bindStateCache.get(cacheKey);
+
+      if (cached && now - cached.at < CONFIG.BIND_STATE_CACHE_TTL_MS) {
+        return cached.value;
+      }
+
+      const value = Inventory.computeBindState(item);
+      state.bindStateCache.set(cacheKey, { at: now, value });
+
+      if (state.bindStateCache.size > 500) {
+        state.bindStateCache.forEach((entry, key) => {
+          if (now - entry.at >= CONFIG.BIND_STATE_CACHE_TTL_MS) {
+            state.bindStateCache.delete(key);
+          }
+        });
+      }
+
+      return value;
+    },
+
+    invalidateBindStateCache() {
+      state.bindStateCache.clear();
+    },
+
+    computeBindState(item) {
       const stats = item?._cachedStats || {};
-      const itemNode = document.querySelector(`.item-id-${item?.id}`);
+      const itemNode = item?.id
+        ? document.querySelector(`.item-id-${item.id}`)
+        : null;
       const domBindText = Utils.normalizeText(
         [
           itemNode?.getAttribute("data-tip"),
@@ -954,7 +1101,14 @@ const ALLOWED_ITEM_TYPES = [
           .filter((value) => value !== undefined && value !== null)
           .join(" | ")
       );
-      const statsSerialized = Utils.normalizeText(JSON.stringify(stats));
+
+      let statsSerialized = "";
+      try {
+        statsSerialized = Utils.normalizeText(JSON.stringify(stats));
+      } catch (error) {
+        statsSerialized = "";
+      }
+
       const bindParts = [
         stats.bind,
         stats.bound,
@@ -978,12 +1132,6 @@ const ALLOWED_ITEM_TYPES = [
 
       const hasNegation =
         bindText.includes("niezwiaz") || bindText.includes("unbound");
-      const hasAnyBindKeyword =
-        bindText.includes("bind") ||
-        bindText.includes("bound") ||
-        bindText.includes("zwiaz") ||
-        bindText.includes("wiaze po") ||
-        bindText.includes("wiaze sie");
 
       const isBindsByBind =
         !hasNegation &&
@@ -1077,21 +1225,23 @@ const ALLOWED_ITEM_TYPES = [
         !isPermboundByFlags &&
         !hasNegation &&
         !isExplicitlySafeUnbound &&
-        (isGenericBoundByFlags || bindText.includes("zwiaz") || bindText.includes("bound"));
+        (isGenericBoundByFlags ||
+          bindText.includes("zwiaz") ||
+          bindText.includes("bound"));
 
       const isSoulbound = isSoulboundByBind || isSoulboundByFlags;
       const isPermbound = isPermboundByBind || isPermboundByFlags;
       const isBinds = isBindsByBind || isBindsByFlags;
 
-      let state = "unbound";
+      let bindStateName = "unbound";
       if (isPermbound) {
-        state = "permbound";
+        bindStateName = "permbound";
       } else if (isSoulbound) {
-        state = "soulbound";
+        bindStateName = "soulbound";
       } else if (isBinds) {
-        state = "binds";
+        bindStateName = "binds";
       } else if (isUnknownBound) {
-        state = "unknown-bound";
+        bindStateName = "unknown-bound";
       }
 
       return {
@@ -1099,12 +1249,11 @@ const ALLOWED_ITEM_TYPES = [
         isPermbound,
         isBinds,
         isUnknownBound,
-        hasAnyBindKeyword,
         hasNegation,
         isDefinitelyUnboundByText,
         hasExplicitUnboundFlags,
         isExplicitlySafeUnbound,
-        state,
+        state: bindStateName,
       };
     },
 
@@ -1135,11 +1284,22 @@ const ALLOWED_ITEM_TYPES = [
     },
 
     canUseAsReagent(item, allowedRarities) {
-      const itemRarity = item?._cachedStats?.rarity;
-      const isAllowedRarity = allowedRarities.includes(itemRarity);
-      const isAllowedType = ALLOWED_ITEM_TYPES.includes(item.cl);
-      const canBeUsed = !item._cachedStats.hasOwnProperty("artisan_worthless");
-      const isUpgraded = Inventory.isAlreadyEnhanced(item);
+      const cachedStats = item?._cachedStats;
+      if (!cachedStats) return false;
+
+      const itemRarity = cachedStats.rarity;
+      if (!itemRarity) return false;
+
+      if (!allowedRarities.includes(itemRarity)) return false;
+      if (!ALLOWED_ITEM_TYPES.includes(item?.cl)) return false;
+
+      const isWorthless = Object.prototype.hasOwnProperty.call(
+        cachedStats,
+        "artisan_worthless"
+      );
+      if (isWorthless) return false;
+
+      if (Inventory.isAlreadyEnhanced(item)) return false;
 
       const bindState = Inventory.readBindState(item);
       const boundSettings =
@@ -1165,11 +1325,17 @@ const ALLOWED_ITEM_TYPES = [
         return false;
       }
 
-      if (bindState.state === "soulbound" && (!boundSettings.allowSoulbound || !canUseBoundByRarity)) {
+      if (
+        bindState.state === "soulbound" &&
+        (!boundSettings.allowSoulbound || !canUseBoundByRarity)
+      ) {
         return false;
       }
 
-      if (bindState.state === "permbound" && (!boundSettings.allowPermbound || !canUseBoundByRarity)) {
+      if (
+        bindState.state === "permbound" &&
+        (!boundSettings.allowPermbound || !canUseBoundByRarity)
+      ) {
         return false;
       }
 
@@ -1181,13 +1347,7 @@ const ALLOWED_ITEM_TYPES = [
         return false;
       }
 
-      return (
-        isAllowedRarity &&
-        isAllowedType &&
-        itemRarity &&
-        canBeUsed &&
-        !isUpgraded
-      );
+      return true;
     },
 
     getReagents() {
@@ -1203,7 +1363,6 @@ const ALLOWED_ITEM_TYPES = [
     },
 
     getFreeSlotsInfo() {
-      const candidates = [];
       const EXCLUDED_BAG_SLOT_SELECTOR = ".bag-4-slot";
       const EXCLUDED_BAG_SELECTOR = '[data-bag="26"]';
       const isInExcludedBagSlot = (node) =>
@@ -1212,59 +1371,49 @@ const ALLOWED_ITEM_TYPES = [
             node?.closest?.(EXCLUDED_BAG_SELECTOR)
         );
 
+      // 1. API gry jest autorytatywne - probujemy je jako pierwsze.
+      const readEngineFreeSlots = () => {
+        const getter = window.Engine?.items?.getFreeSlots;
+        if (typeof getter !== "function") return null;
+
+        for (const args of [["g"], []]) {
+          try {
+            const value = getter.apply(window.Engine.items, args);
+            if (typeof value === "number" && Number.isFinite(value) && value >= 0) {
+              return value;
+            }
+          } catch (error) {
+            // Nastepna proba.
+          }
+        }
+
+        return null;
+      };
+
+      const engineFreeSlots = readEngineFreeSlots();
+
+      if (engineFreeSlots !== null) {
+        const excludedBagEmptySlots = [
+          ...document.querySelectorAll(`${EXCLUDED_BAG_SELECTOR} .item.empty`),
+          ...document.querySelectorAll(`${EXCLUDED_BAG_SELECTOR} .slot.empty`),
+        ].length;
+
+        return {
+          freeSlots: Math.max(0, engineFreeSlots - excludedBagEmptySlots),
+          source: "Engine.items.getFreeSlots",
+          excludedBagEmptySlots,
+        };
+      }
+
+      // 2. Fallback na DOM. Bierzemy MINIMUM, bo zawyzenie liczby wolnych slotow
+      //    powoduje, ze auto-ulepszanie nigdy sie nie odpali. Zanizenie jest
+      //    nieszkodliwe - najwyzej odpali sie troche wczesniej.
+      const candidates = [];
       const addCandidate = (freeSlots, source, extra = {}) => {
         if (typeof freeSlots !== "number" || !Number.isFinite(freeSlots)) return;
         if (freeSlots < 0) return;
         candidates.push({ freeSlots, source, ...extra });
       };
-
-      let directFree = null;
-      if (
-        window.Engine?.items?.getFreeSlots &&
-        typeof window.Engine.items.getFreeSlots === "function"
-      ) {
-        try {
-          directFree = window.Engine.items.getFreeSlots("g");
-        } catch (error) {
-          directFree = null;
-        }
-
-        if (!(typeof directFree === "number" && directFree >= 0)) {
-          try {
-            directFree = window.Engine.items.getFreeSlots();
-          } catch (error) {
-            directFree = null;
-          }
-        }
-      }
-
-      const excludedBagEmptySlots = [
-        ...document.querySelectorAll(`${EXCLUDED_BAG_SELECTOR} .item.empty`),
-        ...document.querySelectorAll(`${EXCLUDED_BAG_SELECTOR} .slot.empty`),
-      ].length;
-
-      const bagNodes = [...document.querySelectorAll(".item.bag")].filter(
-        (node) => !isInExcludedBagSlot(node)
-      );
-      if (bagNodes.length > 0) {
-        let hasParsedBagAmount = false;
-        const freeFromBags = bagNodes.reduce((sum, node) => {
-          const rawAmount = node.querySelector(".amount")?.textContent || "";
-          const match = String(rawAmount).match(/\d+/);
-          if (!match) return sum;
-
-          hasParsedBagAmount = true;
-          return sum + Utils.toNumber(match[0], 0);
-        }, 0);
-
-        if (hasParsedBagAmount) {
-          addCandidate(freeFromBags, "DOM .item.bag .amount", {
-            totalSlots: null,
-            occupiedSlots: null,
-            bagCount: bagNodes.length,
-          });
-        }
-      }
 
       const emptySelectors = [
         ".inventory .item.empty",
@@ -1297,10 +1446,16 @@ const ALLOWED_ITEM_TYPES = [
         document.querySelector(".scroll-pane");
 
       if (inventoryRoot) {
-        const totalSlots = [...inventoryRoot.querySelectorAll(".item, .slot")].filter(
-          (node) => !isInExcludedBagSlot(node)
-        ).length;
-        const occupiedSlots = Engine.items.fetchLocationItems("g").length;
+        let occupiedSlots = 0;
+        try {
+          occupiedSlots = Engine.items.fetchLocationItems("g").length;
+        } catch (error) {
+          occupiedSlots = 0;
+        }
+
+        const totalSlots = [
+          ...inventoryRoot.querySelectorAll(".item, .slot"),
+        ].filter((node) => !isInExcludedBagSlot(node)).length;
 
         if (totalSlots > 0 && totalSlots >= occupiedSlots) {
           addCandidate(totalSlots - occupiedSlots, "DOM total - occupied", {
@@ -1318,10 +1473,14 @@ const ALLOWED_ITEM_TYPES = [
         }).length;
 
         if (allItemNodes.length > 0 && allItemNodes.length >= occupiedFromDom) {
-          addCandidate(allItemNodes.length - occupiedFromDom, "DOM .item - .item-id-*", {
-            totalSlots: allItemNodes.length,
-            occupiedSlots: occupiedFromDom,
-          });
+          addCandidate(
+            allItemNodes.length - occupiedFromDom,
+            "DOM .item - .item-id-*",
+            {
+              totalSlots: allItemNodes.length,
+              occupiedSlots: occupiedFromDom,
+            }
+          );
         }
       }
 
@@ -1330,8 +1489,9 @@ const ALLOWED_ITEM_TYPES = [
         const slotNodes = [...scrollPane.querySelectorAll(".item, .slot")].filter(
           (node) => !isInExcludedBagSlot(node)
         );
+
         if (slotNodes.length > 0) {
-          const occupiedInScrollPane = [...slotNodes].filter((node) => {
+          const occupiedInScrollPane = slotNodes.filter((node) => {
             const className = typeof node.className === "string" ? node.className : "";
             return /item-id-\d+/.test(className);
           }).length;
@@ -1348,15 +1508,7 @@ const ALLOWED_ITEM_TYPES = [
       }
 
       if (candidates.length > 0) {
-        candidates.sort((a, b) => b.freeSlots - a.freeSlots);
-        return candidates[0];
-      }
-
-      if (typeof directFree === "number" && Number.isFinite(directFree)) {
-        const adjustedDirectFree = Math.max(0, directFree - excludedBagEmptySlots);
-        addCandidate(adjustedDirectFree, "Engine.items.getFreeSlots - excluded bag 26", {
-          excludedBagEmptySlots,
-        });
+        candidates.sort((a, b) => a.freeSlots - b.freeSlots);
         return candidates[0];
       }
 
@@ -1471,39 +1623,70 @@ const ALLOWED_ITEM_TYPES = [
           font-size: 0.75rem;
           font-weight: 700;
       }
+          /* --- Panel --------------------------------------------------------
+             Gestosc sterowana zmiennymi: przelacznik ukladu zmienia odstepy i
+             wysokosci, a NIE rozmiary czcionek (od tego jest osobna skala). */
           .upgrader-launcher {
+            --ql-pad: 9px;
+            --ql-gap: 7px;
+            --ql-w: 192px;
+            --ql-w-open: 356px;
+            --ql-icon: 38px;
+            --ql-track-h: 16px;
+            --ql-btn-h: 28px;
+            --ql-card-pad: 8px;
+            --ql-grip: 9px;
+
             position: fixed;
             right: 16px;
             top: 150px;
-            width: 226px;
+            width: var(--ql-w);
             z-index: 99999;
+            box-sizing: border-box;
+            padding: var(--ql-pad);
+            padding-bottom: calc(var(--ql-pad) + var(--ql-grip));
             border: 1px solid var(--ql-border);
             border-radius: var(--ql-radius-lg);
             background: var(--ql-bg);
             color: var(--ql-text);
-            cursor: default;
-            font-weight: 500;
             font-family: var(--ql-font);
-            box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+            font-weight: 500;
+            cursor: default;
             user-select: none;
-            padding: 12px;
-            box-sizing: border-box;
+            box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+            transform: scale(var(--ql-scale, 1));
+            transform-origin: top left;
             transition: width 0.28s cubic-bezier(0.4, 0, 0.2, 1);
           }
-          .upgrader-launcher.is-expanded {
-            width: 380px;
+          .upgrader-launcher.is-cozy {
+            --ql-pad: 12px;
+            --ql-gap: 10px;
+            --ql-w: 226px;
+            --ql-w-open: 384px;
+            --ql-icon: 46px;
+            --ql-track-h: 19px;
+            --ql-btn-h: 32px;
+            --ql-card-pad: 10px;
           }
+          .upgrader-launcher.is-expanded {
+            width: var(--ql-w-open);
+          }
+          .upgrader-launcher.is-resizing {
+            transition: none !important;
+          }
+
+          /* --- Naglowek ----------------------------------------------------- */
           .upgrader-launcher-header {
             display: flex;
             align-items: center;
             gap: 6px;
-            margin: -12px -12px 10px -12px;
-            padding: 11px 12px;
+            margin: calc(var(--ql-pad) * -1) calc(var(--ql-pad) * -1) var(--ql-gap);
+            padding: calc(var(--ql-pad) - 1px) var(--ql-pad);
           }
           .upgrader-launcher-gear {
             flex: 0 0 auto;
-            width: 22px;
-            height: 22px;
+            width: 20px;
+            height: 20px;
             padding: 0;
             display: flex;
             align-items: center;
@@ -1516,8 +1699,8 @@ const ALLOWED_ITEM_TYPES = [
             transition: background 0.15s ease, color 0.15s ease;
           }
           .upgrader-launcher-gear svg {
-            width: 13px;
-            height: 13px;
+            width: 12px;
+            height: 12px;
             transition: transform 0.28s ease;
           }
           .upgrader-launcher.is-expanded .upgrader-launcher-gear svg {
@@ -1529,9 +1712,11 @@ const ALLOWED_ITEM_TYPES = [
           }
           .upgrader-launcher-title {
             flex: 1 1 auto;
-            font-size: 16px;
+            min-width: 0;
+            font-size: 12px;
             font-weight: 800;
-            letter-spacing: 0.2px;
+            letter-spacing: 0.6px;
+            text-transform: uppercase;
             text-align: center;
             cursor: move;
             color: var(--ql-text);
@@ -1547,44 +1732,57 @@ const ALLOWED_ITEM_TYPES = [
             background: var(--ql-bg-soft);
             border: 1px solid var(--ql-border);
             border-radius: 999px;
-            padding: 2px 7px;
-            min-width: 10px;
+            padding: 2px 6px;
+            min-width: 8px;
             text-align: center;
           }
-          .upgrader-launcher-item-wrap {
-            margin-bottom: 8px;
+
+          /* --- Wiersz glowny: ikona + pasek + licznik w jednej linii --------
+             Wczesniej byly to trzy osobne bloki jeden pod drugim (~90 px). */
+          .upgrader-launcher-main {
+            display: flex;
+            align-items: center;
+            gap: var(--ql-gap);
+            margin-bottom: var(--ql-gap);
           }
           .upgrader-launcher-item-box {
-            width: 100%;
-            height: 46px;
-            border: 1px solid var(--ql-border);
-            border-radius: var(--ql-radius-md);
-            background: var(--ql-bg-softer);
+            flex: 0 0 auto;
+            width: var(--ql-icon);
+            height: var(--ql-icon);
+            box-sizing: border-box;
             display: flex;
             align-items: center;
             justify-content: center;
             overflow: hidden;
-            box-sizing: border-box;
+            border: 1px solid var(--ql-rarity-color, var(--ql-border));
+            border-radius: var(--ql-radius-md);
+            background: var(--ql-bg-softer);
+            box-shadow: 0 0 6px -1px var(--ql-rarity-glow, transparent);
+            cursor: help;
           }
           .upgrader-launcher-item-box-empty {
-            font-size: 10px;
+            font-size: 16px;
+            font-weight: 300;
+            line-height: 1;
             color: var(--ql-text-mute);
-            text-align: center;
-            padding: 0 6px;
           }
-          .upgrader-launcher-progress-wrap {
-            margin-bottom: 8px;
+          .upgrader-launcher-meters {
+            flex: 1 1 auto;
+            min-width: 0;
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
           }
           .upgrader-launcher-progress-track {
             position: relative;
             width: 100%;
-            height: 20px;
+            height: var(--ql-track-h);
+            box-sizing: border-box;
             border-radius: 999px;
             border: 1px solid var(--ql-border);
             background: rgba(255, 255, 255, 0.06);
             box-shadow: inset 0 2px 4px rgba(0, 0, 0, 0.45);
             overflow: hidden;
-            box-sizing: border-box;
           }
           .upgrader-launcher-progress-fill {
             position: absolute;
@@ -1612,7 +1810,7 @@ const ALLOWED_ITEM_TYPES = [
             top: 0;
             right: 0;
             bottom: 0;
-            width: 10px;
+            width: 8px;
             background: rgba(255, 255, 255, 0.75);
             filter: blur(3px);
             opacity: 0.85;
@@ -1642,11 +1840,13 @@ const ALLOWED_ITEM_TYPES = [
             text-overflow: ellipsis;
           }
           .upgrader-launcher-counter {
-            margin-bottom: 10px;
-            text-align: center;
+            margin: 0;
             font-size: 10px;
             font-weight: 700;
-            line-height: 1.35;
+            line-height: 1.2;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
             color: var(--ql-red);
           }
           .upgrader-launcher-counter--good {
@@ -1661,7 +1861,7 @@ const ALLOWED_ITEM_TYPES = [
           .upgrader-launcher-main-btn {
             display: block;
             width: 100%;
-            height: 32px;
+            height: var(--ql-btn-h);
             border: 1px solid var(--ql-border);
             border-radius: 999px;
             background: var(--ql-bg-soft);
@@ -1677,6 +1877,8 @@ const ALLOWED_ITEM_TYPES = [
             color: var(--ql-black-on-white);
             border-color: var(--ql-white-pill);
           }
+
+          /* --- Ustawienia --------------------------------------------------- */
           .upgrader-settings-body {
             max-height: 0;
             opacity: 0;
@@ -1686,55 +1888,166 @@ const ALLOWED_ITEM_TYPES = [
               opacity 0.22s ease, margin-top 0.28s ease;
           }
           .upgrader-launcher.is-expanded .upgrader-settings-body {
-            max-height: 900px;
+            max-height: 1200px;
             opacity: 1;
-            margin-top: 12px;
+            margin-top: var(--ql-gap);
           }
-          .upgrader-grid-3 {
+          .upgrader-grid-2 {
             display: grid;
-            grid-template-columns: 1fr 1fr 1fr;
-            gap: 10px;
-            margin-top: 10px;
+            grid-template-columns: 1fr 1fr;
+            gap: var(--ql-gap);
           }
           .upgrader-card {
-            border: 1px solid var(--ql-border);
-            border-radius: var(--ql-radius-md);
-            padding: 10px;
-            background: var(--ql-bg-softer);
             box-sizing: border-box;
             min-width: 0;
+            padding: var(--ql-card-pad);
+            border: 1px solid var(--ql-border);
+            border-radius: var(--ql-radius-md);
+            background: var(--ql-bg-softer);
+          }
+          .upgrader-card--wide {
+            grid-column: 1 / -1;
           }
           .upgrader-card-title {
-            font-size: 11px;
+            font-size: 10px;
             font-weight: 700;
-            letter-spacing: 0.3px;
+            letter-spacing: 0.5px;
             text-transform: uppercase;
+            color: var(--ql-text-mute);
+            margin-bottom: 6px;
+          }
+          .upgrader-row {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 8px;
+            margin-bottom: 6px;
+            font-size: 12px;
+            line-height: 1.25;
+            color: var(--ql-text);
+          }
+          .upgrader-row:last-child {
+            margin-bottom: 0;
+          }
+          .upgrader-row > span:first-child {
+            min-width: 0;
+            overflow: hidden;
+            text-overflow: ellipsis;
+          }
+          .upgrader-row-tail {
+            flex: 0 0 auto;
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+          }
+          .upgrader-row-value {
+            flex: 0 0 auto;
+            font-weight: 700;
             color: var(--ql-text-dim);
-            margin-bottom: 7px;
           }
-          .upgrader-gui-rarity-list-col {
-            flex-direction: column;
-            gap: 7px;
+          .upgrader-note {
+            margin-top: 5px;
+            font-size: 11px;
+            line-height: 1.35;
+            color: var(--ql-text-dim);
           }
+          .upgrader-note--warn {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            color: var(--ql-red);
+          }
+          .upgrader-slider {
+            display: block;
+            width: 100%;
+            margin: 2px 0 0;
+            accent-color: var(--ql-text);
+          }
+          .upgrader-slider:disabled {
+            opacity: 0.4;
+          }
+
+          /* Rarity jako chipy - trzy pozycje mieszcza sie w jednej-dwoch liniach
+             zamiast trzech osobnych wierszy. */
+          .upgrader-chips {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 4px;
+          }
+          .upgrader-gui-rarity-item {
+            display: inline-flex;
+            align-items: center;
+            gap: 5px;
+            padding: 3px 8px;
+            border: 1px solid var(--ql-border);
+            border-radius: 999px;
+            background: var(--ql-bg-soft);
+            font-size: 11px;
+            line-height: 1;
+            cursor: pointer;
+            transition: border-color 0.15s ease, background 0.15s ease;
+          }
+          .upgrader-gui-rarity-item:hover {
+            border-color: var(--ql-border-strong);
+          }
+          .upgrader-rarity-common {
+            color: var(--ql-text-dim);
+          }
+          .upgrader-rarity-unique {
+            color: #eab308;
+          }
+          .upgrader-rarity-heroic {
+            color: var(--ql-blue);
+          }
+          .upgrader-hotkeys-grid {
+            display: grid;
+            grid-template-columns: 1fr 28px;
+            gap: 5px;
+            align-items: center;
+          }
+          .upgrader-hotkeys-label {
+            font-size: 11px;
+            font-weight: 500;
+            color: var(--ql-text-dim);
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+          }
+          .upgrader-hotkeys-input {
+            box-sizing: border-box;
+            width: 100%;
+            height: 24px;
+            padding: 0;
+            font-size: 12px;
+            font-weight: 700;
+            border: 1px solid var(--ql-border-strong);
+            border-radius: var(--ql-radius-sm);
+            background: var(--ql-bg-soft);
+            color: var(--ql-text);
+            text-align: center;
+            cursor: pointer;
+          }
+
           .upgrader-gui-row {
             display: flex;
-            gap: 7px;
-            margin-top: 10px;
+            gap: 5px;
+            margin-top: var(--ql-gap);
           }
           .upgrader-gui-btn {
+            flex: 1;
+            min-width: 0;
+            height: var(--ql-btn-h);
+            padding: 0 6px;
             border: 1px solid var(--ql-border);
             border-radius: 999px;
             background: var(--ql-bg-soft);
             color: var(--ql-text);
-            height: 34px;
-            cursor: pointer;
-          }
-          .upgrader-gui-btn {
-            padding: 0 12px;
-            cursor: pointer;
-            font-size: 12px;
+            font-size: 11px;
             font-weight: 700;
-            flex: 1;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            cursor: pointer;
             transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease;
           }
           .upgrader-gui-btn:hover {
@@ -1742,240 +2055,207 @@ const ALLOWED_ITEM_TYPES = [
             color: var(--ql-black-on-white);
             border-color: var(--ql-white-pill);
           }
-            .upgrader-select-hint {
-              margin-top: 10px;
-              border: 1px solid var(--ql-border);
-              border-radius: var(--ql-radius-md);
-              padding: 10px;
-              background: var(--ql-bg-softer);
-              font-size: 11px;
-              line-height: 1.4;
-              color: var(--ql-text-dim);
+          .upgrader-mini-btn {
+            flex: 0 0 auto;
+            padding: 2px 8px;
+            border: 1px solid var(--ql-border);
+            border-radius: 999px;
+            background: var(--ql-bg-soft);
+            color: var(--ql-text-dim);
+            font-size: 10px;
+            font-weight: 700;
+            cursor: pointer;
+            transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease;
+          }
+          .upgrader-mini-btn:hover {
+            background: var(--ql-white-pill);
+            color: var(--ql-black-on-white);
+            border-color: var(--ql-white-pill);
+          }
+          .upgrader-tooltip-trigger {
+            flex: 0 0 auto;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            width: 15px;
+            height: 15px;
+            border-radius: 50%;
+            border: 1px solid var(--ql-border-strong);
+            color: var(--ql-text-dim);
+            font-size: 10px;
+            line-height: 1;
+            background: var(--ql-bg-soft);
+            cursor: help;
+          }
+          .upgrader-selected-preview-item {
+            width: 100% !important;
+            height: 100% !important;
+            box-sizing: border-box;
+            border: 0 !important;
+            margin: 0 !important;
+            padding: 0 !important;
+            position: relative !important;
+            left: 0 !important;
+            top: 0 !important;
+            right: auto !important;
+            bottom: auto !important;
+            transform: none !important;
+            display: block !important;
+            overflow: hidden;
+          }
+          .upgrader-selected-preview-icon {
+            width: 100%;
+            height: 100%;
+            display: block;
+            image-rendering: pixelated;
+            object-fit: contain;
+            position: relative;
+            z-index: 1;
+          }
+          .upgrader-launcher input[type="checkbox"] {
+            appearance: none;
+            -webkit-appearance: none;
+            flex: 0 0 auto;
+            position: relative;
+            width: 15px;
+            height: 15px;
+            margin: 0;
+            border-radius: 4px;
+            border: 1px solid var(--ql-border-strong);
+            background: var(--ql-bg-soft);
+            cursor: pointer;
+            transition: background 0.15s ease, border-color 0.15s ease;
+          }
+          .upgrader-launcher input[type="checkbox"]:checked {
+            background: var(--ql-white-pill);
+            border-color: var(--ql-white-pill);
+          }
+          .upgrader-launcher input[type="checkbox"]:checked::after {
+            content: "";
+            position: absolute;
+            left: 4px;
+            top: 0px;
+            width: 3px;
+            height: 7px;
+            border: solid var(--ql-black-on-white);
+            border-width: 0 2px 2px 0;
+            transform: rotate(45deg);
+          }
+          .upgrader-launcher-resize {
+            position: absolute;
+            right: 3px;
+            bottom: 3px;
+            width: 12px;
+            height: 12px;
+            cursor: nwse-resize;
+            opacity: 0.28;
+            border-radius: 3px;
+            transition: opacity 0.15s ease;
+            background-image:
+              linear-gradient(
+                135deg,
+                transparent 0 46%,
+                var(--ql-text-dim) 46% 58%,
+                transparent 58% 100%
+              ),
+              linear-gradient(
+                135deg,
+                transparent 0 74%,
+                var(--ql-text-dim) 74% 86%,
+                transparent 86% 100%
+              );
+          }
+          .upgrader-launcher-resize:hover {
+            opacity: 0.95;
+          }
+
+            .upgrader-notification {
+              position: fixed;
+              top: 30%;
+              left: 50%;
+              transform: translate(-50%, -50%) scale(0.9);
+              z-index: 99999;
+              min-width: 160px;
+              max-width: 200px;
+              padding: 8px 12px;
+              border-radius: 8px;
+              background: rgba(30, 20, 60, 0.4);
+              backdrop-filter: blur(16px);
+              box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4), 0 0 0 1px rgba(168, 85, 247, 0.2);
+              color: #ffffff;
+              font-family: var(--ql-font);
+              text-align: center;
+              pointer-events: none;
+              opacity: 0;
+              transition: opacity 0.4s cubic-bezier(0.34, 1.56, 0.64, 1),
+                transform 0.4s cubic-bezier(0.34, 1.56, 0.64, 1);
             }
-            .upgrader-selected-preview-box {
-              min-height: 48px;
-              display: flex;
-              align-items: center;
-              gap: 10px;
-              position: relative;
+            .upgrader-notification.is-visible {
+              opacity: 1;
+              transform: translate(-50%, -50%) scale(1);
             }
-            .upgrader-selected-preview-item {
+            .upgrader-notification.is-leaving {
+              opacity: 0;
+              transform: translate(-50%, -60%) scale(0.95);
+            }
+            .upgrader-notification-kicker {
+              font-size: 8px;
+              font-weight: 600;
+              letter-spacing: 0.5px;
+              text-transform: uppercase;
+              margin-bottom: 4px;
+              opacity: 0.75;
+              color: #e0e7ff;
+            }
+            .upgrader-notification-icon {
+              display: inline-block;
               width: 32px;
               height: 32px;
-              box-sizing: border-box;
-              border: 1px solid var(--ql-rarity-color, var(--ql-border));
-              box-shadow: 0 0 6px -1px var(--ql-rarity-glow, transparent);
-              background: rgba(255, 255, 255, 0.03);
-              position: relative !important;
-              left: 0 !important;
-              top: 0 !important;
-              right: auto !important;
-              bottom: auto !important;
-              margin: 0 !important;
-              transform: none !important;
-              display: block !important;
-              flex: 0 0 auto;
-              overflow: hidden;
-              border-radius: var(--ql-radius-sm);
+              margin-bottom: 4px;
             }
-            .upgrader-selected-preview-icon {
+            .upgrader-notification-icon img {
               width: 100%;
               height: 100%;
-              display: block;
-              flex: 0 0 auto;
               image-rendering: pixelated;
-              object-fit: contain;
-              position: relative;
-              z-index: 1;
             }
-            .upgrader-gui-rarity-wrap {
-              margin-top: 10px;
-              border: 1px solid var(--ql-border);
-              border-radius: var(--ql-radius-md);
-              padding: 10px;
-              background: var(--ql-bg-softer);
-            }
-            .upgrader-gui-rarity-title {
+            .upgrader-notification-name {
               font-size: 12px;
               font-weight: 700;
-              letter-spacing: 0.3px;
-              text-transform: uppercase;
-              margin-bottom: 7px;
-              color: var(--ql-text-dim);
+              margin-bottom: 3px;
+              text-shadow: 0 1px 4px rgba(0, 0, 0, 0.5);
+              line-height: 1.1;
+              word-break: break-word;
             }
-            .upgrader-gui-rarity-list {
-              display: flex;
-              gap: 12px;
-              flex-wrap: wrap;
-            }
-            .upgrader-gui-rarity-item {
-              display: inline-flex;
-              align-items: center;
-              gap: 6px;
-              font-size: 12px;
-              color: var(--ql-text);
-            }
-            .upgrader-rarity-common {
-              color: var(--ql-text-dim);
-            }
-            .upgrader-rarity-unique {
-              color: #eab308;
-            }
-            .upgrader-rarity-heroic {
-              color: var(--ql-blue);
-            }
-            .upgrader-bound-wrap {
-              margin-top: 10px;
-              border: 1px solid var(--ql-border);
-              border-radius: var(--ql-radius-md);
-              padding: 10px;
-              background: var(--ql-bg-softer);
-            }
-            .upgrader-bound-item {
-              display: flex;
-              align-items: center;
-              justify-content: space-between;
-              gap: 12px;
-              font-size: 12px;
-              color: var(--ql-text);
-              margin-bottom: 7px;
-            }
-            .upgrader-bound-item span:first-child {
-              font-weight: 500;
-            }
-            .upgrader-bound-item:last-child {
-              margin-bottom: 0;
-            }
-            .upgrader-bound-warning {
-              margin-top: 5px;
+            .upgrader-notification-level {
+              display: inline-block;
+              background: rgba(255, 255, 255, 0.15);
+              border-radius: 8px;
+              padding: 2px 8px;
+              margin-bottom: 4px;
               font-size: 11px;
-              color: var(--ql-red);
-              display: inline-flex;
-              align-items: center;
-              gap: 7px;
+              font-weight: 700;
             }
-            .upgrader-tooltip-trigger {
-              position: relative;
-              display: inline-flex;
-              align-items: center;
-              justify-content: center;
-              width: 16px;
-              height: 16px;
-              border-radius: 50%;
-              border: 1px solid var(--ql-border-strong);
-              color: var(--ql-text-dim);
-              font-size: 11px;
-              line-height: 1;
-              background: var(--ql-bg-soft);
-              cursor: help;
-            }
-            .upgrader-tooltip-trigger[data-tooltip]:hover::after {
-              content: attr(data-tooltip);
-              position: absolute;
-              left: 0;
-              bottom: calc(100% + 6px);
-              max-width: 220px;
-              padding: 7px 10px;
-              border-radius: var(--ql-radius-sm);
-              border: 1px solid var(--ql-border);
-              background: #0a0a0b;
-              color: var(--ql-text);
+            .upgrader-notification-counter {
               font-size: 10px;
-              line-height: 1.35;
-              white-space: normal;
-              z-index: 15;
-              box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
-              pointer-events: none;
+              font-weight: 600;
+              margin-bottom: 3px;
+              opacity: 0.8;
+              color: #e0e7ff;
             }
-            .upgrader-hotkeys-wrap {
-              margin-top: 10px;
-              border: 1px solid var(--ql-border);
-              border-radius: var(--ql-radius-md);
-              padding: 10px;
-              background: var(--ql-bg-softer);
+            .upgrader-notification-points {
+              font-size: 18px;
+              font-weight: 800;
+              color: #fbbf24;
+              text-shadow: 0 0 12px rgba(251, 191, 36, 0.6), 0 1px 4px rgba(0, 0, 0, 0.5);
             }
-            .upgrader-hotkeys-grid {
-              display: grid;
-              grid-template-columns: 1fr 38px;
-              gap: 7px;
-              align-items: center;
+            .upgrader-notification-footer {
+              font-size: 7px;
+              font-weight: 600;
+              margin-top: 2px;
+              opacity: 0.65;
+              color: #e0e7ff;
             }
-            .upgrader-hotkeys-label {
-              font-size: 12px;
-              font-weight: 500;
-              color: var(--ql-text-dim);
-              align-self: center;
-            }
-            .upgrader-hotkeys-input {
-              font-size: 12px;
-              font-weight: 700;
-              border: 1px solid var(--ql-border-strong);
-              border-radius: var(--ql-radius-sm);
-              background: var(--ql-bg-soft);
-              color: var(--ql-text);
-              height: 29px;
-              text-align: center;
-              cursor: pointer;
-            }
-            .upgrader-auto-wrap {
-              margin-top: 10px;
-              border: 1px solid var(--ql-border);
-              border-radius: var(--ql-radius-md);
-              padding: 10px;
-              background: var(--ql-bg-softer);
-            }
-            .upgrader-auto-row {
-              display: flex;
-              align-items: center;
-              justify-content: space-between;
-              gap: 7px;
-              margin-bottom: 10px;
-              font-size: 12px;
-              color: var(--ql-text);
-            }
-            .upgrader-auto-row label {
-              font-weight: 500;
-            }
-            .upgrader-auto-slider {
-              width: 100%;
-              accent-color: var(--ql-text);
-            }
-            .upgrader-auto-slider:disabled {
-              opacity: 0.4;
-            }
-            .upgrader-auto-info {
-              margin-top: 5px;
-              font-size: 11px;
-              color: var(--ql-text-dim);
-            }
-            .upgrader-launcher input[type="checkbox"] {
-              appearance: none;
-              -webkit-appearance: none;
-              width: 16px;
-              height: 16px;
-              border-radius: 4px;
-              border: 1px solid var(--ql-border-strong);
-              background: var(--ql-bg-soft);
-              cursor: pointer;
-              flex: 0 0 auto;
-              position: relative;
-              transition: background 0.15s ease, border-color 0.15s ease;
-            }
-            .upgrader-launcher input[type="checkbox"]:checked {
-              background: var(--ql-white-pill);
-              border-color: var(--ql-white-pill);
-            }
-            .upgrader-launcher input[type="checkbox"]:checked::after {
-              content: "";
-              position: absolute;
-              left: 5px;
-              top: 1px;
-              width: 4px;
-              height: 8px;
-              border: solid var(--ql-black-on-white);
-              border-width: 0 2px 2px 0;
-              transform: rotate(45deg);
-            }
+
     `;
 
       const style = document.createElement("style");
@@ -2008,30 +2288,57 @@ const ALLOWED_ITEM_TYPES = [
       return false;
     },
 
-    prepareEnhancementWindow() {
-      const wasOpenBeforeRun = Ui.isCraftingWindowOpen();
-      const hideCssClass = "upgrader-crafting-window";
-
-      if (!wasOpenBeforeRun) {
-        Engine.crafting.window.wnd.$.addClass(hideCssClass);
-        Engine.interface.clickCrafting();
-      } else {
-        Engine.crafting.window.wnd.$.addClass(hideCssClass);
+    getCraftingWindowNode() {
+      try {
+        return Engine?.crafting?.window?.wnd?.$ || null;
+      } catch (error) {
+        return null;
       }
-
-      return { wasOpenBeforeRun, hideCssClass };
     },
 
-    restoreEnhancementWindow(session = {}) {
-      const wasOpenBeforeRun = Boolean(session?.wasOpenBeforeRun);
-      const hideCssClass = session?.hideCssClass || null;
+    prepareEnhancementWindow() {
+      const hideCssClass = "upgrader-crafting-window";
+      const session = { wasOpenBeforeRun: false, hideCssClass: null };
 
-      if (hideCssClass) {
-        Engine.crafting.window.wnd.$.removeClass(hideCssClass);
+      const craftingWindow = Ui.getCraftingWindowNode();
+      if (!craftingWindow) return session;
+
+      session.wasOpenBeforeRun = Ui.isCraftingWindowOpen();
+
+      // hideCssClass zapisujemy PRZED addClass - gdyby cokolwiek nizej rzucilo,
+      // restoreEnhancementWindow i tak zdejmie klase i nie zostawi ukrytego okna.
+      session.hideCssClass = hideCssClass;
+
+      try {
+        craftingWindow.addClass(hideCssClass);
+
+        if (!session.wasOpenBeforeRun) {
+          Engine.interface.clickCrafting();
+        }
+      } catch (error) {
+        Ui.restoreEnhancementWindow(session);
+        return { wasOpenBeforeRun: session.wasOpenBeforeRun, hideCssClass: null };
       }
 
-      if (!wasOpenBeforeRun && Ui.isCraftingWindowOpen()) {
-        Engine.interface.clickCrafting();
+      return session;
+    },
+
+    restoreEnhancementWindow(session) {
+      const safeSession = session || {};
+      const wasOpenBeforeRun = Boolean(safeSession.wasOpenBeforeRun);
+      const hideCssClass = safeSession.hideCssClass || null;
+
+      try {
+        const craftingWindow = Ui.getCraftingWindowNode();
+        if (craftingWindow && hideCssClass) {
+          craftingWindow.removeClass(hideCssClass);
+        }
+
+        if (hideCssClass && !wasOpenBeforeRun && Ui.isCraftingWindowOpen()) {
+          Engine.interface.clickCrafting();
+        }
+      } catch (error) {
+        // Nic wiecej nie zrobimy - grunt, ze klasa ukrywajaca zostala zdjeta.
       }
     },
 
@@ -2046,10 +2353,53 @@ const ALLOWED_ITEM_TYPES = [
       const upgradedItem = Engine.items.getItemById(upgradedItemId);
       if (!upgradedItem) return;
 
-      $(`.item-id-${upgradedItemId}`).find(".upgrader-label").remove();
+      const $nodes = $(`.item-id-${upgradedItemId}`);
+      $nodes.find(".upgrader-label").remove();
+      $nodes.append($(`<div class="upgrader-label">U</div>`));
+    },
 
-      const label = $(`<div class="upgrader-label">U</div>`);
-      $(`.item-id-${upgradedItemId}`).append(label);
+    // Gra przerysowuje wezly plecaka przy kazdej zmianie ekwipunku, co kasowalo
+    // etykiete "U". Obserwator (z debounce) nakleja ja z powrotem.
+    initUpgradedLabelWatcher() {
+      if (state.upgradedLabelObserver) return;
+
+      let scheduled = false;
+
+      const reapply = () => {
+        scheduled = false;
+
+        const upgradedItemId = Storage.getUpgradedItemId();
+        if (!upgradedItemId) return;
+
+        const nodes = document.querySelectorAll(`.item-id-${upgradedItemId}`);
+        if (nodes.length === 0) return;
+
+        const needsLabel = [...nodes].some(
+          (node) => !node.querySelector(".upgrader-label")
+        );
+        if (!needsLabel) return;
+
+        Ui.markItemAsUpgraded();
+      };
+
+      state.upgradedLabelObserver = new MutationObserver(() => {
+        // Zmiana w plecaku uniewaznia tez cache stanu zwiazania przedmiotow.
+        Inventory.invalidateBindStateCache();
+
+        if (scheduled) return;
+        scheduled = true;
+        setTimeout(reapply, 250);
+      });
+
+      const root =
+        document.querySelector(".inventory") ||
+        document.querySelector(".backpack") ||
+        document.body;
+
+      state.upgradedLabelObserver.observe(root, {
+        childList: true,
+        subtree: true,
+      });
     },
 
     resolveItemIconUrl(item) {
@@ -2171,14 +2521,16 @@ const ALLOWED_ITEM_TYPES = [
       launcherBox.innerHTML = "";
       launcherBox.removeAttribute("title");
 
-      const setEmptyState = (message) => {
+      // Pole podgladu jest male, wiec komunikat idzie do tooltipa, a w srodku
+      // zostaje tylko znacznik - inaczej tekst by sie nie zmiescil.
+      const setEmptyState = (hint) => {
         const empty = document.createElement("div");
         empty.className = "upgrader-launcher-item-box-empty";
-        empty.textContent = message;
+        empty.textContent = "+";
         launcherBox.appendChild(empty);
+        launcherBox.title = hint;
         Ui.applyRarityStyling("");
       };
-
       const selectedId = Storage.getUpgradedItemId();
       if (!selectedId) {
         setEmptyState("Brak przedmiotu");
@@ -2230,8 +2582,10 @@ const ALLOWED_ITEM_TYPES = [
         return;
       }
 
-      state.enhanceCounter = counter.text;
-      Storage.setEnhanceCounter(counter.text);
+      if (state.enhanceCounter !== counter.text) {
+        state.enhanceCounter = counter.text;
+        Storage.setEnhanceCounter(counter.text);
+      }
 
       const dailyPoints = Storage.getDailyEnhancePoints();
       state.dailyEnhancePoints = dailyPoints;
@@ -2248,12 +2602,16 @@ const ALLOWED_ITEM_TYPES = [
     },
 
     refreshDailyEnhancePoints() {
-      const pointsNode = document.getElementById("upgrader-launcher-points");
-      if (!pointsNode) return;
-
       const currentPoints = Storage.getDailyEnhancePoints();
       state.dailyEnhancePoints = currentPoints;
-      pointsNode.textContent = `Punkty dziś: ${Utils.formatPoints(currentPoints)}`;
+
+      // Wezel #upgrader-launcher-points nigdy nie istnial w HTML, wiec wczesniejszy
+      // early-return sprawial, ze ta funkcja nie robila nic - nawet nie odswiezala
+      // stanu. Punkty pokazujemy w linii licznika limitu.
+      const pointsNode = document.getElementById("upgrader-launcher-points");
+      if (pointsNode) {
+        pointsNode.textContent = `Punkty dziś: ${Utils.formatPoints(currentPoints)}`;
+      }
     },
 
     refreshEnhanceProgress() {
@@ -2404,20 +2762,7 @@ const ALLOWED_ITEM_TYPES = [
       wrap.innerHTML = "";
 
       CONFIG.AVAILABLE_RARITIES.forEach((rarity) => {
-        const rarityMeta = {
-          common: {
-            label: "Zwyklaki",
-            className: "upgrader-rarity-common",
-          },
-          unique: {
-            label: "Unikaty",
-            className: "upgrader-rarity-unique",
-          },
-          heroic: {
-            label: "Heroiki",
-            className: "upgrader-rarity-heroic",
-          },
-        };
+        const meta = CONFIG.RARITY_FILTER_META[rarity];
 
         const label = document.createElement("label");
         label.className = "upgrader-gui-rarity-item";
@@ -2427,11 +2772,10 @@ const ALLOWED_ITEM_TYPES = [
         input.className = "upgrader-rarity-checkbox";
         input.value = rarity;
         input.checked = selectedRarities.includes(rarity);
-        input.disabled = false;
 
         const span = document.createElement("span");
-  span.textContent = rarityMeta[rarity]?.label || rarity;
-  span.className = rarityMeta[rarity]?.className || "";
+        span.textContent = meta?.label || rarity;
+        span.className = meta?.className || "";
 
         label.appendChild(input);
         label.appendChild(span);
@@ -2452,7 +2796,7 @@ const ALLOWED_ITEM_TYPES = [
       }
 
       if (hint) {
-        hint.textContent = "Wybór przedmiotu: kliknij PPM na itemie i użyj opcji „Ulepsz ten przedmiot”.";
+        hint.textContent = "Wybór przedmiotu: PPM na itemie → „Ulepsz ten przedmiot”.";
       }
 
       if (autoLabel) {
@@ -2505,8 +2849,11 @@ const ALLOWED_ITEM_TYPES = [
       const button = document.getElementById("upgrader-launcher");
       if (!button) return;
 
-      const maxLeft = Math.max(window.innerWidth - button.offsetWidth, 0);
-      const maxTop = Math.max(window.innerHeight - button.offsetHeight, 0);
+      // getBoundingClientRect, nie offsetWidth - panel bywa przeskalowany
+      // (transform: scale), a offsetWidth zwraca rozmiar sprzed skalowania.
+      const rect = button.getBoundingClientRect();
+      const maxLeft = Math.max(window.innerWidth - rect.width, 0);
+      const maxTop = Math.max(window.innerHeight - rect.height, 0);
 
       const finalLeft = Utils.clamp(left, 0, maxLeft);
       const finalTop = Utils.clamp(top, 0, maxTop);
@@ -2696,7 +3043,7 @@ const ALLOWED_ITEM_TYPES = [
         if (event.button !== 0) return;
         if (
           event.target?.closest?.(
-            "#upgrader-launcher-config-btn, #upgrader-launcher-stock"
+            "#upgrader-launcher-config-btn, #upgrader-launcher-stock, #upgrader-launcher-resize"
           )
         ) {
           return;
@@ -2717,6 +3064,176 @@ const ALLOWED_ITEM_TYPES = [
         const onMouseUp = () => {
           document.removeEventListener("mousemove", onMouseMove);
           document.removeEventListener("mouseup", onMouseUp);
+        };
+
+        document.addEventListener("mousemove", onMouseMove);
+        document.addEventListener("mouseup", onMouseUp);
+      });
+    },
+
+    // --- Skalowanie okna -----------------------------------------------------
+
+    applyUiScale(value, options = {}) {
+      const { persist = true, render = true, keepInViewport = true } = options;
+
+      const raw = Utils.clamp(
+        Utils.toNumber(value, CONFIG.DEFAULT_UI_SCALE),
+        CONFIG.UI_SCALE_RANGE.min,
+        CONFIG.UI_SCALE_RANGE.max
+      );
+      const scale = Math.round(raw * 100) / 100;
+
+      state.uiScale = scale;
+
+      const button = document.getElementById("upgrader-launcher");
+      if (button) {
+        button.style.setProperty("--ql-scale", String(scale));
+      }
+
+      if (persist) {
+        Storage.setUiScale(scale);
+      }
+
+      if (render) {
+        Ui.renderScaleSettings();
+      }
+
+      if (keepInViewport) {
+        Ui.ensureFloatingUiVisible();
+      }
+
+      return scale;
+    },
+
+    renderScaleSettings() {
+      const slider = document.getElementById("upgrader-ui-scale");
+      const label = document.getElementById("upgrader-ui-scale-value");
+      const percent = Math.round(state.uiScale * 100);
+
+      if (slider && document.activeElement !== slider) {
+        slider.value = String(percent);
+      }
+
+      if (label) {
+        label.textContent = `${percent}%`;
+      }
+    },
+
+    bindScaleHandlers() {
+      const slider = document.getElementById("upgrader-ui-scale");
+      const resetButton = document.getElementById("upgrader-ui-scale-reset");
+
+      if (slider) {
+        slider.addEventListener("input", () => {
+          Ui.applyUiScale(Utils.toNumber(slider.value, 100) / 100, {
+            persist: false,
+            render: true,
+            keepInViewport: false,
+          });
+        });
+
+        slider.addEventListener("change", () => {
+          Ui.applyUiScale(Utils.toNumber(slider.value, 100) / 100);
+        });
+      }
+
+      if (resetButton) {
+        resetButton.addEventListener("click", () => {
+          Ui.applyUiScale(CONFIG.DEFAULT_UI_SCALE);
+        });
+      }
+    },
+
+    // Gestosc zmienia wylacznie odstepy, wysokosci i szerokosc panelu (zmienne
+    // CSS). Rozmiary czcionek zostaja bez zmian - od zmniejszania wszystkiego
+    // naraz jest osobny suwak skali.
+    applyDensity(density, options = {}) {
+      const { persist = true, render = true } = options;
+      const normalized = density === "cozy" ? "cozy" : "compact";
+
+      state.density = normalized;
+
+      const button = document.getElementById("upgrader-launcher");
+      if (button) {
+        button.classList.toggle("is-cozy", normalized === "cozy");
+      }
+
+      if (persist) {
+        Storage.setDensity(normalized);
+      }
+
+      if (render) {
+        Ui.renderDensitySettings();
+        // Szerokosc panelu sie zmienila - moze wystawac poza ekran.
+        Ui.ensureFloatingUiVisible();
+      }
+
+      return normalized;
+    },
+
+    renderDensitySettings() {
+      const toggle = document.getElementById("upgrader-compact-mode");
+      if (!toggle) return;
+      toggle.checked = state.density !== "cozy";
+    },
+
+    bindDensityHandlers() {
+      const toggle = document.getElementById("upgrader-compact-mode");
+      if (!toggle) return;
+
+      toggle.addEventListener("change", () => {
+        Ui.applyDensity(toggle.checked ? "compact" : "cozy");
+      });
+    },
+
+    initScaleResize() {
+      const button = document.getElementById("upgrader-launcher");
+      const grip = document.getElementById("upgrader-launcher-resize");
+      if (!button || !grip) return;
+
+      grip.addEventListener("dblclick", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        Ui.applyUiScale(CONFIG.DEFAULT_UI_SCALE);
+      });
+
+      grip.addEventListener("mousedown", (event) => {
+        if (event.button !== 0) return;
+
+        event.preventDefault();
+        event.stopPropagation();
+
+        const startScale = state.uiScale || CONFIG.DEFAULT_UI_SCALE;
+        const rect = button.getBoundingClientRect();
+
+        // Rozmiar bazowy = rozmiar przed skalowaniem; dzieki temu przesuniecie
+        // uchwytu o N pikseli zmienia szerokosc panelu mniej wiecej o N pikseli.
+        const baseWidth = Math.max(1, rect.width / startScale);
+        const baseHeight = Math.max(1, rect.height / startScale);
+
+        const startX = event.clientX;
+        const startY = event.clientY;
+
+        button.classList.add("is-resizing");
+
+        const onMouseMove = (moveEvent) => {
+          const deltaX = moveEvent.clientX - startX;
+          const deltaY = moveEvent.clientY - startY;
+          const nextScale =
+            startScale + (deltaX / baseWidth + deltaY / baseHeight) / 2;
+
+          Ui.applyUiScale(nextScale, {
+            persist: false,
+            render: true,
+            keepInViewport: false,
+          });
+        };
+
+        const onMouseUp = () => {
+          document.removeEventListener("mousemove", onMouseMove);
+          document.removeEventListener("mouseup", onMouseUp);
+          button.classList.remove("is-resizing");
+          Ui.applyUiScale(state.uiScale);
         };
 
         document.addEventListener("mousemove", onMouseMove);
@@ -2885,13 +3402,21 @@ const ALLOWED_ITEM_TYPES = [
       Ui.syncInterfaceWidgetDragState(widgetButton);
 
       if (!state.interfaceWidgetDragObserver) {
-        state.interfaceWidgetDragObserver = new MutationObserver(() => {
-          const currentWidget = document.getElementById("upgrader-interface-widget");
-          if (currentWidget) {
-            Ui.syncInterfaceWidgetDragState(currentWidget);
-          }
-        });
+        // Debounce - gra mutuje DOM praktycznie bez przerwy.
+        let scheduled = false;
 
+        state.interfaceWidgetDragObserver = new MutationObserver(() => {
+          if (scheduled) return;
+          scheduled = true;
+
+          setTimeout(() => {
+            scheduled = false;
+            const currentWidget = document.getElementById("upgrader-interface-widget");
+            if (currentWidget) {
+              Ui.syncInterfaceWidgetDragState(currentWidget);
+            }
+          }, 250);
+        });
         state.interfaceWidgetDragObserver.observe(document.body, {
           childList: true,
           subtree: true,
@@ -3209,10 +3734,19 @@ const ALLOWED_ITEM_TYPES = [
 
       tryMount();
 
+      // Gra mutuje DOM bardzo czesto - bez debounce ten callback odpalal sie
+      // setki razy na sekunde.
+      let scheduled = false;
       const observer = new MutationObserver(() => {
-        if (!document.getElementById("upgrader-interface-widget")) {
-          Ui.mountInterfaceWidget();
-        }
+        if (scheduled) return;
+        scheduled = true;
+
+        setTimeout(() => {
+          scheduled = false;
+          if (!document.getElementById("upgrader-interface-widget")) {
+            Ui.mountInterfaceWidget();
+          }
+        }, 400);
       });
 
       observer.observe(document.body, {
@@ -3275,7 +3809,7 @@ const ALLOWED_ITEM_TYPES = [
       if (!triggerNode) return;
 
       const text = String(
-        triggerNode.getAttribute("data-upgrader-tooltip") || ""
+        triggerNode.getAttribute("data-tooltip") || ""
       ).trim();
       if (!text) return;
 
@@ -3315,8 +3849,10 @@ const ALLOWED_ITEM_TYPES = [
     },
 
     bindTooltipHandlers() {
+      // Atrybut musi sie zgadzac z tym w HTML (data-tooltip) - wczesniej selektor
+      // szukal data-upgrader-tooltip i nie trafial w nic.
       const triggers = document.querySelectorAll(
-        ".upgrader-tooltip-trigger[data-upgrader-tooltip]"
+        ".upgrader-tooltip-trigger[data-tooltip]"
       );
 
       triggers.forEach((triggerNode) => {
@@ -3330,21 +3866,18 @@ const ALLOWED_ITEM_TYPES = [
           Ui.showAddonLikeTooltip(triggerNode);
         });
 
-        triggerNode.addEventListener("mousemove", () => {
-          Ui.showAddonLikeTooltip(triggerNode);
-        });
-
         triggerNode.addEventListener("mouseleave", () => {
           Ui.hideAddonLikeTooltip();
         });
       });
     },
 
+    // Budowane z wezlow DOM, nie z innerHTML - nazwa przedmiotu pochodzi z serwera
+    // i cudzyslow albo "<" w niej rozwalal szablon (a w gorszym razie wstrzykiwal znacznik).
     showEnhancementCompletionNotification(data) {
       const notificationId = "upgrader-enhancement-notification";
       let notification = document.getElementById(notificationId);
 
-      // Anuluj poprzedni timer jeśli istnieje
       if (state.enhancementNotificationTimer) {
         clearTimeout(state.enhancementNotificationTimer);
         state.enhancementNotificationTimer = null;
@@ -3353,80 +3886,57 @@ const ALLOWED_ITEM_TYPES = [
       if (!notification) {
         notification = document.createElement("div");
         notification.id = notificationId;
-        notification.style.cssText = `
-          position: fixed;
-          top: 30%;
-          left: 50%;
-          transform: translate(-50%, -50%) scale(0.9);
-          z-index: 99999;
-          min-width: 160px;
-          max-width: 200px;
-          padding: 8px 12px;
-          border-radius: 8px;
-          background: rgba(30, 20, 60, 0.4);
-          backdrop-filter: blur(16px);
-          box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4), 0 0 0 1px rgba(168,85,247,0.2);
-          color: #ffffff;
-          font-family: "Segoe UI Variable", "Segoe UI", "Trebuchet MS", Tahoma, sans-serif;
-          text-align: center;
-          pointer-events: none;
-          opacity: 0;
-          transition: all 0.4s cubic-bezier(0.34, 1.56, 0.64, 1);
-        `;
+        notification.className = "upgrader-notification";
         document.body.appendChild(notification);
       }
 
-      // Resetuj stan powiadomienia
-      notification.style.opacity = "0";
-      notification.style.transform = "translate(-50%, -50%) scale(0.9)";
+      notification.classList.remove("is-visible", "is-leaving");
+      notification.replaceChildren();
 
-      // Pobierz grafikę przedmiotu
-      let itemIconHtml = '';
+      const addLine = (className, text) => {
+        const node = document.createElement("div");
+        node.className = className;
+        node.textContent = text;
+        notification.appendChild(node);
+        return node;
+      };
+
+      addLine("upgrader-notification-kicker", "\u2728 Ulepszono");
+
       if (data.itemId) {
         const sourceNode = document.querySelector(`.item-id-${data.itemId}`);
-        if (sourceNode) {
-          const sourceCanvas = sourceNode.querySelector("canvas.icon.canvas-icon");
-          if (sourceCanvas) {
-            const iconSrc = sourceCanvas.toDataURL("image/png");
-            itemIconHtml = `
-              <div style="display: inline-block; width: 32px; height: 32px; margin-bottom: 4px;">
-                <img src="${iconSrc}" alt="${data.itemName}" style="width: 100%; height: 100%; image-rendering: pixelated;" />
-              </div>
-            `;
+        const sourceCanvas = sourceNode?.querySelector("canvas.icon.canvas-icon");
+
+        if (sourceCanvas) {
+          try {
+            const iconWrap = document.createElement("div");
+            iconWrap.className = "upgrader-notification-icon";
+
+            const icon = document.createElement("img");
+            icon.src = sourceCanvas.toDataURL("image/png");
+            icon.alt = String(data.itemName || "Przedmiot");
+
+            iconWrap.appendChild(icon);
+            notification.appendChild(iconWrap);
+          } catch (error) {
+            // Canvas moze byc "tainted" - wtedy po prostu pomijamy ikone.
           }
         }
       }
 
-      notification.innerHTML = `
-        <div style="font-size: 8px; font-weight: 600; letter-spacing: 0.5px; text-transform: uppercase; margin-bottom: 4px; opacity: 0.75; color: #e0e7ff;">
-          ✨ Ulepszono
-        </div>
-        ${itemIconHtml}
-        <div style="font-size: 12px; font-weight: 700; margin-bottom: 3px; text-shadow: 0 1px 4px rgba(0,0,0,0.5); line-height: 1.1;">
-          ${data.itemName}
-        </div>
-        <div style="display: inline-block; background: rgba(255,255,255,0.15); border-radius: 8px; padding: 2px 8px; margin-bottom: 4px; font-size: 11px; font-weight: 700;">
-          ${data.level}
-        </div>
-        <div style="font-size: 10px; font-weight: 600; margin-bottom: 3px; opacity: 0.8; color: #e0e7ff;">
-          Limit: ${data.counter}
-        </div>
-        <div style="font-size: 18px; font-weight: 800; color: #fbbf24; text-shadow: 0 0 12px rgba(251,191,36,0.6), 0 1px 4px rgba(0,0,0,0.5);">
-          +${data.points}
-        </div>
-        <div style="font-size: 7px; font-weight: 600; margin-top: 2px; opacity: 0.65; color: #e0e7ff;">
-          punktów ulepszenia
-        </div>
-      `;
+      addLine("upgrader-notification-name", String(data.itemName || "Przedmiot"));
+      addLine("upgrader-notification-level", String(data.level));
+      addLine("upgrader-notification-counter", `Limit: ${data.counter}`);
+      addLine("upgrader-notification-points", `+${data.points}`);
+      addLine("upgrader-notification-footer", "punktów ulepszenia");
 
       requestAnimationFrame(() => {
-        notification.style.opacity = "1";
-        notification.style.transform = "translate(-50%, -50%) scale(1)";
+        notification.classList.add("is-visible");
       });
 
       state.enhancementNotificationTimer = setTimeout(() => {
-        notification.style.opacity = "0";
-        notification.style.transform = "translate(-50%, -60%) scale(0.95)";
+        notification.classList.remove("is-visible");
+        notification.classList.add("is-leaving");
         state.enhancementNotificationTimer = null;
       }, 3500);
     },
@@ -3456,6 +3966,8 @@ const ALLOWED_ITEM_TYPES = [
         Ui.renderBoundSettings();
         Ui.renderHotkeyInputs();
         Ui.renderAutoSettings();
+        Ui.renderScaleSettings();
+        Ui.renderDensitySettings();
         Ui.refreshEnhanceCounter();
       }
     },
@@ -3475,99 +3987,132 @@ const ALLOWED_ITEM_TYPES = [
             </svg>
           </button>
           <div id="upgrader-launcher-title" class="upgrader-launcher-title">Quick Forge</div>
-          <div id="upgrader-launcher-stock" class="upgrader-launcher-stock" title="Ilość przedmiotów możliwych do wrzucenia teraz">0</div>
+          <div id="upgrader-launcher-stock" class="upgrader-launcher-stock" title="Składniki możliwe do wrzucenia teraz">0</div>
         </div>
 
-        <div id="upgrader-launcher-item-wrap" class="upgrader-launcher-item-wrap">
+        <div class="upgrader-launcher-main">
           <div id="upgrader-launcher-item-box" class="upgrader-launcher-item-box"></div>
-        </div>
-
-        <div id="upgrader-launcher-progress-wrap" class="upgrader-launcher-progress-wrap">
-          <div class="upgrader-launcher-progress-track">
-            <div id="upgrader-launcher-progress-fill" class="upgrader-launcher-progress-fill" style="width:0%"></div>
-            <div id="upgrader-launcher-progress-label" class="upgrader-launcher-progress-label">-- / --</div>
+          <div class="upgrader-launcher-meters">
+            <div class="upgrader-launcher-progress-track">
+              <div id="upgrader-launcher-progress-fill" class="upgrader-launcher-progress-fill" style="width:0%"></div>
+              <div id="upgrader-launcher-progress-label" class="upgrader-launcher-progress-label">-- / --</div>
+            </div>
+            <div id="upgrader-launcher-counter" class="upgrader-launcher-counter">LIMIT: --/--</div>
           </div>
         </div>
-
-        <div id="upgrader-launcher-counter" class="upgrader-launcher-counter">LIMIT: --/--</div>
 
         <button id="upgrader-launcher-enhance-btn" class="upgrader-launcher-main-btn">ULEPSZ</button>
 
         <div id="upgrader-settings-body" class="upgrader-settings-body">
-          <div id="upgrader-select-hint" class="upgrader-select-hint">Wybór przedmiotu: kliknij PPM na itemie i użyj opcji „Ulepsz ten przedmiot”.</div>
-
-          <div class="upgrader-card">
-            <div class="upgrader-auto-row">
-              <label id="upgrader-auto-label" for="upgrader-auto-enabled">Auto ulepszanie</label>
-              <input id="upgrader-auto-enabled" type="checkbox" />
-            </div>
-            <div class="upgrader-auto-row">
-              <label for="upgrader-auto-min-free-slots">Próg wolnych slotów: <span id="upgrader-auto-min-free-slots-value">6</span></label>
-            </div>
-            <input
-              id="upgrader-auto-min-free-slots"
-              class="upgrader-auto-slider"
-              type="range"
-              min="${CONFIG.AUTO_MIN_FREE_SLOTS_RANGE.min}"
-              max="${CONFIG.AUTO_MIN_FREE_SLOTS_RANGE.max}"
-              value="${CONFIG.DEFAULT_AUTO_SETTINGS.minFreeSlots}"
-            />
-            <div id="upgrader-auto-free-slots-info" class="upgrader-auto-info"></div>
-          </div>
-
-          <div class="upgrader-grid-3">
+          <div class="upgrader-grid-2">
             <div class="upgrader-card">
-              <div class="upgrader-card-title">Rarity składników</div>
-              <div id="upgrader-rarity-list" class="upgrader-gui-rarity-list upgrader-gui-rarity-list-col"></div>
+              <div class="upgrader-card-title">Auto</div>
+              <label class="upgrader-row" for="upgrader-auto-enabled">
+                <span id="upgrader-auto-label">Auto ulepszanie</span>
+                <input id="upgrader-auto-enabled" type="checkbox" />
+              </label>
+              <div class="upgrader-row">
+                <span>Próg slotów</span>
+                <span id="upgrader-auto-min-free-slots-value" class="upgrader-row-value">6</span>
+              </div>
+              <input
+                id="upgrader-auto-min-free-slots"
+                class="upgrader-slider"
+                type="range"
+                min="${CONFIG.AUTO_MIN_FREE_SLOTS_RANGE.min}"
+                max="${CONFIG.AUTO_MIN_FREE_SLOTS_RANGE.max}"
+                value="${CONFIG.DEFAULT_AUTO_SETTINGS.minFreeSlots}"
+              />
+              <div id="upgrader-auto-free-slots-info" class="upgrader-note"></div>
             </div>
 
             <div class="upgrader-card">
-              <div class="upgrader-card-title">Zwiazane przedmioty</div>
-              <label class="upgrader-bound-item" for="upgrader-allow-soulbound">
+              <div class="upgrader-card-title">Związane</div>
+              <label class="upgrader-row" for="upgrader-allow-soulbound">
                 <span>Z właścicielem</span>
                 <input id="upgrader-allow-soulbound" type="checkbox" />
               </label>
-              <label class="upgrader-bound-item" for="upgrader-allow-permbound">
+              <label class="upgrader-row" for="upgrader-allow-permbound">
                 <span>Na stałe</span>
                 <input id="upgrader-allow-permbound" type="checkbox" />
               </label>
-              <div class="upgrader-bound-warning">Może spalić przedmioty.
+              <div class="upgrader-note upgrader-note--warn">
+                <span>Może spalić przedmioty</span>
                 <span class="upgrader-tooltip-trigger" data-tooltip="Ta reguła nie działa na heroiki oraz na przedmioty ulepszone">?</span>
               </div>
             </div>
 
+            <div class="upgrader-card upgrader-card--wide">
+              <div class="upgrader-card-title">Składniki</div>
+              <div id="upgrader-rarity-list" class="upgrader-chips"></div>
+            </div>
+
             <div class="upgrader-card">
-              <div class="upgrader-card-title">Skróty klawiszowe</div>
+              <div class="upgrader-card-title">Skróty</div>
               <div class="upgrader-hotkeys-grid">
-                <div class="upgrader-hotkeys-label">Ulepszanie</div>
+                <span class="upgrader-hotkeys-label">Ulepszanie</span>
                 <input id="upgrader-hotkey-enhance" maxlength="1" class="upgrader-hotkeys-input" />
-                <div class="upgrader-hotkeys-label">Ustawienia (SHIFT+)</div>
+                <span class="upgrader-hotkeys-label">Panel (SHIFT+)</span>
                 <input id="upgrader-hotkey-gui" maxlength="1" class="upgrader-hotkeys-input" />
               </div>
             </div>
+
+            <div class="upgrader-card">
+              <div class="upgrader-card-title">Widok</div>
+              <label class="upgrader-row" for="upgrader-compact-mode" title="Gęstsze odstępy i mniejszy panel. Rozmiar czcionki bez zmian.">
+                <span>Kompaktowy układ</span>
+                <input id="upgrader-compact-mode" type="checkbox" />
+              </label>
+              <div class="upgrader-row">
+                <span>Skala <span id="upgrader-ui-scale-value" class="upgrader-row-value">100%</span></span>
+                <button id="upgrader-ui-scale-reset" class="upgrader-mini-btn" type="button" title="Przywróć 100%">Reset</button>
+              </div>
+              <input
+                id="upgrader-ui-scale"
+                class="upgrader-slider"
+                type="range"
+                min="${Math.round(CONFIG.UI_SCALE_RANGE.min * 100)}"
+                max="${Math.round(CONFIG.UI_SCALE_RANGE.max * 100)}"
+                step="5"
+                value="100"
+              />
+            </div>
           </div>
+
+          <div id="upgrader-select-hint" class="upgrader-note"></div>
 
           <div class="upgrader-gui-row">
             <button id="upgrader-clear-btn" class="upgrader-gui-btn">Wyczyść</button>
-            <button id="upgrader-rarity-save-btn" class="upgrader-gui-btn">Reset punktów</button>
-            <button id="upgrader-hotkey-save-btn" class="upgrader-gui-btn">Zapisz skróty</button>
+            <button id="upgrader-reset-points-btn" class="upgrader-gui-btn">Reset pkt</button>
+            <button id="upgrader-hotkey-save-btn" class="upgrader-gui-btn">Zapisz</button>
           </div>
         </div>
+
+        <div id="upgrader-launcher-resize" class="upgrader-launcher-resize" title="Przeciągnij, aby zmienić skalę (dwuklik przywraca 100%)"></div>
       `;
 
       document.body.appendChild(button);
 
+      Ui.applyDensity(state.density, { persist: false, render: false });
+      Ui.applyUiScale(state.uiScale, {
+        persist: false,
+        render: false,
+        keepInViewport: false,
+      });
       Ui.applyButtonPosition();
       Ui.ensureFloatingUiVisible();
       state.viewportSize = Ui.getViewportSize();
       Ui.initViewportResizeHandler();
       Ui.initButtonDrag();
+      Ui.initScaleResize();
       Ui.bindLauncherButtons();
       Ui.ensureInterfaceWidgetMounted();
       Ui.syncLauncherVisibility();
       Ui.bindAutoSettingsHandlers();
       Ui.bindBoundSettingsHandlers();
       Ui.bindRarityAutoSaveHandlers();
+      Ui.bindScaleHandlers();
+      Ui.bindDensityHandlers();
       Ui.bindTooltipHandlers();
 
       document
@@ -3577,7 +4122,7 @@ const ALLOWED_ITEM_TYPES = [
         });
 
       document
-        .getElementById("upgrader-rarity-save-btn")
+        .getElementById("upgrader-reset-points-btn")
         .addEventListener("click", () => {
           state.dailyEnhancePoints = Storage.setDailyEnhancePoints(0);
           Ui.refreshDailyEnhancePoints();
@@ -3600,6 +4145,8 @@ const ALLOWED_ITEM_TYPES = [
       Ui.renderRarityOptions();
       Ui.renderBoundSettings();
       Ui.renderAutoSettings();
+      Ui.renderScaleSettings();
+      Ui.renderDensitySettings();
       Ui.refreshEnhanceCounter();
       Ui.refreshDailyEnhancePoints();
       Ui.refreshEnhanceProgress();
@@ -3607,9 +4154,19 @@ const ALLOWED_ITEM_TYPES = [
     },
 
     initItemContextMenu() {
+      // Bez tego podwojne wstrzykniecie skryptu opakowywaloby showPopupMenu dwa
+      // razy i pozycja w menu dublowalaby sie.
+      if (state.popupMenuHooked) return;
+      if (typeof Engine?.interface?.showPopupMenu !== "function") return;
+
       const ogShowPopupMenu = Engine.interface.showPopupMenu;
-      Engine.interface.showPopupMenu = function (menu, e) {
-        const itemId = Utils.getItemIdFromClassName(e.currentTarget?.className);
+      if (ogShowPopupMenu.__upgraderPopupMenuHooked) {
+        state.popupMenuHooked = true;
+        return;
+      }
+
+      const hooked = function (menu, e) {
+        const itemId = Utils.getItemIdFromClassName(e?.currentTarget?.className);
 
         if (!itemId) {
           return ogShowPopupMenu.call(this, menu, e);
@@ -3646,9 +4203,12 @@ const ALLOWED_ITEM_TYPES = [
                 { button: { cls: "menu-item--yellow" } },
               ];
 
-        const updatedMenu = [menuItem, ...menu];
-        ogShowPopupMenu.call(this, updatedMenu, e);
+        ogShowPopupMenu.call(this, [menuItem, ...menu], e);
       };
+
+      hooked.__upgraderPopupMenuHooked = true;
+      Engine.interface.showPopupMenu = hooked;
+      state.popupMenuHooked = true;
     },
   };
 
@@ -3712,34 +4272,48 @@ const ALLOWED_ITEM_TYPES = [
         return result;
       }
 
+      // Jedno try/finally na cala funkcje. Wczesniej getReagents() lezalo poza
+      // blokiem i dowolny wyjatek zostawial isEnhancing na true na stale, co po
+      // cichu zabijalo dodatek az do przeladowania strony.
       state.isEnhancing = true;
-
-      const upgradedItemId = Storage.getUpgradedItemId();
-      const upgradedItem = Engine.items.getItemById(upgradedItemId);
-      result.itemName = upgradedItem?.name || null;
-
-      if (!upgradedItem) {
-        result.status = "missing-item";
-        if (!silent) {
-          message("Wybierz przedmiot do ulepszenia.");
-        }
-        state.isEnhancing = false;
-        return result;
-      }
-
-      const reagents = Inventory.getReagents();
-      if (reagents.length === 0) {
-        result.status = "missing-reagents";
-        if (!silent) {
-          message("Nie znaleziono odpowiednich składników.");
-        }
-        state.isEnhancing = false;
-        return result;
-      }
-
       let enhancementSession = null;
 
       try {
+        const upgradedItemId = Storage.getUpgradedItemId();
+        const upgradedItem = upgradedItemId
+          ? Engine.items.getItemById(upgradedItemId)
+          : null;
+        result.itemName = upgradedItem?.name || null;
+
+        if (!upgradedItem) {
+          result.status = "missing-item";
+          if (!silent) {
+            message("Wybierz przedmiot do ulepszenia.");
+          }
+          return result;
+        }
+
+        const reagents = Inventory.getReagents();
+        if (reagents.length === 0) {
+          result.status = "missing-reagents";
+          if (!silent) {
+            message("Nie znaleziono odpowiednich składników.");
+          }
+          return result;
+        }
+
+        const stopAsMaxed = () => {
+          result.reachedMaxEnhancement = true;
+          result.status = "max-enhancement-reached";
+          if (!silent) {
+            const name = upgradedItem?.name ? ` ${upgradedItem.name}` : "";
+            message(
+              `Przedmiot${name} został maksymalnie ulepszony. Dalsze ulepszanie zostało zatrzymane.`
+            );
+          }
+          return result;
+        };
+
         result.status = "running";
         state.enhancementRunSummary = {
           itemId: upgradedItemId,
@@ -3747,19 +4321,14 @@ const ALLOWED_ITEM_TYPES = [
           totalPoints: 0,
           upgradeLevel: null,
         };
+
         enhancementSession = Ui.prepareEnhancementWindow();
+
         const chunks = Utils.chunk(reagents, CONFIG.MAX_REAGENTS);
         const statusResponse = await EnhancementApi.setEnhancedItem(upgradedItemId);
 
         if (Utils.hasMaxEnhancementState(statusResponse)) {
-          result.reachedMaxEnhancement = true;
-          result.status = "max-enhancement-reached";
-          if (!silent) {
-            message(
-              `Przedmiot${upgradedItem?.name ? ` ${upgradedItem.name}` : ""} został maksymalnie ulepszony. Dalsze ulepszanie zostało zatrzymane.`
-            );
-          }
-          return result;
+          return stopAsMaxed();
         }
 
         let counterSnapshot = Utils.getEnhanceCounterSnapshot();
@@ -3782,18 +4351,14 @@ const ALLOWED_ITEM_TYPES = [
         }
 
         for (const chunk of chunks) {
-          if (remainingToLimit !== null && remainingToLimit <= 0) {
-            break;
-          }
+          if (remainingToLimit !== null && remainingToLimit <= 0) break;
 
           const maxAllowedInChunk =
             remainingToLimit === null
               ? chunk.length
               : Math.min(chunk.length, remainingToLimit);
 
-          if (maxAllowedInChunk <= 0) {
-            break;
-          }
+          if (maxAllowedInChunk <= 0) break;
 
           const reagentsToUse =
             maxAllowedInChunk === chunk.length
@@ -3806,36 +4371,30 @@ const ALLOWED_ITEM_TYPES = [
           );
 
           if (Utils.hasMaxEnhancementState(reagentsPreviewResponse)) {
-            result.reachedMaxEnhancement = true;
-            result.status = "max-enhancement-reached";
-            if (!silent) {
-              message(
-                `Przedmiot${upgradedItem?.name ? ` ${upgradedItem.name}` : ""} został maksymalnie ulepszony. Dalsze ulepszanie zostało zatrzymane.`
-              );
-            }
-            return result;
+            return stopAsMaxed();
           }
+
+          // Gra dopiero teraz przerysuje podglad punktow. Czekamy na klatke i
+          // zapisujemy odczyt, zeby hook na _g nie zlapal wartosci z poprzedniej
+          // partii (to byl wyscig gubiacy punkty dzienne).
+          await Utils.nextFrame();
+          state.pendingPreviewPoints = Utils.getEnhancePreviewPoints();
 
           const enhanceItemResponse = await EnhancementApi.enhanceItem(
             upgradedItemId,
             reagentsToUse
           );
 
+          state.pendingPreviewPoints = null;
+
           if (Utils.hasMaxEnhancementState(enhanceItemResponse)) {
-            result.reachedMaxEnhancement = true;
-            result.status = "max-enhancement-reached";
-            if (!silent) {
-              message(
-                `Przedmiot${upgradedItem?.name ? ` ${upgradedItem.name}` : ""} został maksymalnie ulepszony. Dalsze ulepszanie zostało zatrzymane.`
-              );
-            }
-            return result;
+            return stopAsMaxed();
           }
 
-          const { count, limit } = enhanceItemResponse.enhancement.usages_preview;
+          const usagesPreview = enhanceItemResponse?.enhancement?.usages_preview;
+          const parsedCount = Utils.toNumber(usagesPreview?.count, NaN);
+          const parsedLimit = Utils.toNumber(usagesPreview?.limit, NaN);
 
-          const parsedCount = Utils.toNumber(count, NaN);
-          const parsedLimit = Utils.toNumber(limit, NaN);
           if (Number.isFinite(parsedCount) && Number.isFinite(parsedLimit)) {
             remainingToLimit = Math.max(0, parsedLimit - parsedCount);
             counterSnapshot = {
@@ -3851,51 +4410,57 @@ const ALLOWED_ITEM_TYPES = [
               result.status = "limit-reached";
             }
           } else if (remainingToLimit !== null) {
-            remainingToLimit = Math.max(0, remainingToLimit - reagentsToUse.length);
+            remainingToLimit = Math.max(
+              0,
+              remainingToLimit - reagentsToUse.length
+            );
+          }
+
+          // Brak odpowiedzi to najczesciej blad sieci albo serwera - nie ma sensu
+          // wysylac kolejnych partii skladnikow w ciemno.
+          if (!enhanceItemResponse) {
+            result.status = "api-error";
+            if (!silent) {
+              message("Serwer nie odpowiedział na żądanie ulepszenia.");
+            }
+            break;
           }
 
           await Utils.sleep(300);
         }
 
-        if (result.status !== "limit-reached") {
+        if (result.status === "running") {
           result.status = "done";
         }
 
-        const enhancementRunSummary = state.enhancementRunSummary;
-        if (
-          !silent &&
-          enhancementRunSummary &&
-          enhancementRunSummary.totalPoints > 0
-        ) {
-          const levelValue = Utils.toNumber(
-            enhancementRunSummary.upgradeLevel,
-            NaN
-          );
-          const levelText = Number.isFinite(levelValue)
-            ? `+${levelValue}`
-            : "+?";
+        const runSummary = state.enhancementRunSummary;
+        if (!silent && runSummary && runSummary.totalPoints > 0) {
+          const levelValue = Utils.toNumber(runSummary.upgradeLevel, NaN);
+          const levelText = Number.isFinite(levelValue) ? `+${levelValue}` : "+?";
 
-          const counterSnapshot = Utils.getEnhanceCounterSnapshot();
-          const counterText = counterSnapshot
-            ? `${counterSnapshot.current}/${counterSnapshot.limit}`
+          const finalCounter = Utils.getEnhanceCounterSnapshot();
+          const counterText = finalCounter
+            ? `${finalCounter.current}/${finalCounter.limit}`
             : "--/--";
 
           Ui.showEnhancementCompletionNotification({
-            itemId: enhancementRunSummary.itemId,
-            itemName: enhancementRunSummary.itemName || "Przedmiot",
+            itemId: runSummary.itemId,
+            itemName: runSummary.itemName || "Przedmiot",
             level: levelText,
             counter: counterText,
-            points: Utils.formatPoints(enhancementRunSummary.totalPoints),
+            points: Utils.formatPoints(runSummary.totalPoints),
           });
         }
+
+        return result;
       } finally {
+        state.pendingPreviewPoints = null;
         state.enhancementRunSummary = null;
         Ui.restoreEnhancementWindow(enhancementSession);
+        Inventory.invalidateBindStateCache();
         state.isEnhancing = false;
         Ui.refreshEnhanceCounter();
       }
-
-      return result;
     },
 
     async checkAutoEnhance() {
@@ -3952,32 +4517,64 @@ const ALLOWED_ITEM_TYPES = [
     },
 
     startEnhanceCounterSyncLoop() {
+      let tick = 0;
+
       setInterval(() => {
+        tick += 1;
+
         Ui.refreshEnhanceCounter();
         Ui.refreshDailyEnhancePoints();
         Ui.refreshEnhanceProgress();
-        Ui.refreshReagentStock();
-      }, 1200);
+
+        // Skan calego plecaka jest drogi - wystarczy co ~4 s.
+        if (tick % 2 === 0) {
+          Ui.refreshReagentStock();
+        }
+      }, 2000);
+    },
+
+    // Sprzatanie przeterminowanych kluczy trzymamy z dala od getterow, zeby
+    // odczyt licznika nie pisal do localStorage kilkadziesiat razy na minute.
+    startMaintenanceLoop() {
+      setInterval(() => {
+        try {
+          Storage.cleanupStaleEntries();
+        } catch (error) {
+          // Brak dostepu do localStorage - nic nie mozemy zrobic.
+        }
+      }, 60000);
+    },
+
+    isTypingTarget(element) {
+      if (!element) return false;
+      if (element.isContentEditable) return true;
+
+      const tagName = String(element.tagName || "").toUpperCase();
+      return ["TEXTAREA", "MAGIC_INPUT", "INPUT", "SELECT"].includes(tagName);
     },
 
     bindHotkey() {
       window.document.addEventListener("keydown", async (event) => {
-        const isInputActive = ["TEXTAREA", "MAGIC_INPUT", "INPUT"].includes(
-          document.activeElement.tagName
-        );
-        if (isInputActive) return;
+        // Bez tego Ctrl+J / Alt+J (i inne skroty przegladarki) odpalaly ulepszanie.
+        if (event.ctrlKey || event.altKey || event.metaKey) return;
+        if (event.isComposing || event.repeat) return;
+        if (Automation.isTypingTarget(document.activeElement)) return;
 
         const key = String(event.key || "").toLowerCase();
-        const hotkeys = state.hotkeys || CONFIG.DEFAULT_HOTKEYS;
-        const activeActionHotkey = hotkeys.enhance;
+        if (!key || key.length !== 1) return;
 
-        if (event.shiftKey && key === hotkeys.gui) {
-          event.preventDefault();
-          Ui.toggleGui();
+        const hotkeys = state.hotkeys || CONFIG.DEFAULT_HOTKEYS;
+
+        if (event.shiftKey) {
+          if (key === hotkeys.gui) {
+            event.preventDefault();
+            Ui.toggleGui();
+          }
           return;
         }
 
-        if (key === activeActionHotkey) {
+        if (key === hotkeys.enhance) {
+          event.preventDefault();
           await Automation.runPrimaryAction();
         }
       });
@@ -4006,7 +4603,7 @@ const ALLOWED_ITEM_TYPES = [
       if (typeof window._g !== "function") return;
 
       const hookFlag = "__upgraderEnhancementProgressHooked";
-      if (window._g && window._g[hookFlag]) {
+      if (window._g[hookFlag]) {
         state.enhancementProgressHooked = true;
         return;
       }
@@ -4023,8 +4620,12 @@ const ALLOWED_ITEM_TYPES = [
           (arg, index) => index > 0 && typeof arg === "function"
         );
 
+        // Wartosc zapisana przez petle ulepszania jest pewniejsza niz swiezy odczyt
+        // z DOM - ten drugi bywa jeszcze nieprzerysowany w momencie wyslania zadania.
         const previewPoints = isEnhancementProgressRequest
-          ? Utils.getEnhancePreviewPoints()
+          ? Number.isFinite(state.pendingPreviewPoints)
+            ? state.pendingPreviewPoints
+            : Utils.getEnhancePreviewPoints()
           : null;
 
         if (isEnhancementProgressRequest && callbackIndex !== -1) {
@@ -4073,7 +4674,9 @@ const ALLOWED_ITEM_TYPES = [
                   );
                 }
               }
-            } catch (error) {}
+            } catch (error) {
+              // Ksiegowanie punktow nie moze wywrocic wlasciwego callbacku gry.
+            }
 
             return originalCallback.apply(this, callbackArgs);
           };
@@ -4083,22 +4686,41 @@ const ALLOWED_ITEM_TYPES = [
       };
 
       window._g[hookFlag] = true;
-
       state.enhancementProgressHooked = true;
     },
 
   };
 
   const Bootstrap = {
+    attempts: 0,
+
     init() {
+      let engineReady = false;
       try {
-        if (!window.Engine.allInit) {
-          setTimeout(Bootstrap.init, 500);
+        engineReady = Boolean(window.Engine && window.Engine.allInit);
+      } catch (error) {
+        engineReady = false;
+      }
+
+      if (!engineReady) {
+        Bootstrap.attempts += 1;
+
+        // Wczesniej ta petla probowala w nieskonczonosc.
+        if (Bootstrap.attempts > CONFIG.BOOTSTRAP_MAX_ATTEMPTS) {
+          console.warn(
+            "[ulepszator] Engine gry nie wystartował - dodatek nie został uruchomiony."
+          );
           return;
         }
-      } catch (error) {
+
         setTimeout(Bootstrap.init, 500);
         return;
+      }
+
+      try {
+        Storage.cleanupStaleEntries();
+      } catch (error) {
+        // Brak dostepu do localStorage nie moze blokowac startu dodatku.
       }
 
       state.hotkeys = Storage.getHotkeys();
@@ -4107,6 +4729,8 @@ const ALLOWED_ITEM_TYPES = [
       state.enhanceCounter = Storage.getEnhanceCounter();
       state.dailyEnhancePoints = Storage.getDailyEnhancePoints();
       state.launcherVisible = Storage.getLauncherVisibility();
+      state.uiScale = Storage.getUiScale();
+      state.density = Storage.getDensity();
 
       Runtime.initEnhancementProgressHook();
       Ui.setupCss();
@@ -4114,8 +4738,10 @@ const ALLOWED_ITEM_TYPES = [
       Automation.bindHotkey();
       Automation.startAutoEnhanceLoop();
       Automation.startEnhanceCounterSyncLoop();
+      Automation.startMaintenanceLoop();
       Ui.initItemContextMenu();
       Ui.markItemAsUpgraded();
+      Ui.initUpgradedLabelWatcher();
     },
   };
 
