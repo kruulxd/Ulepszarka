@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         ulepszator by Kruul
 // @namespace    http://tampermonkey.net/
-// @version      0.2.1
-// @description  Auto ulepszanie przedmiotów w Margonem (Quick Forge)
+// @version      0.2.2
+// @description  Auto ulepszanie przedmiotów
 // @author       Kruul
 // @match        https://*.margonem.pl/*
 // @updateURL    https://raw.githubusercontent.com/kruulxd/Ulepszarka/main/ulepszarka-wild.user.js
@@ -61,6 +61,7 @@ const CONFIG = {
   BOOTSTRAP_MAX_ATTEMPTS: 120,
   BIND_STATE_CACHE_TTL_MS: 4000,
   DEFAULT_UI_SCALE: 1,
+  UI_SCALE_STEP: 0.1,
   DEFAULT_DENSITY: "compact",
   UI_SCALE_RANGE: {
     min: 0.7,
@@ -2028,6 +2029,58 @@ const ALLOWED_ITEM_TYPES = [
             cursor: pointer;
           }
 
+          .upgrader-stepper {
+            flex: 0 0 auto;
+            display: inline-flex;
+            align-items: center;
+            gap: 4px;
+          }
+          .upgrader-step-btn {
+            flex: 0 0 auto;
+            width: 20px;
+            height: 20px;
+            padding: 0;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            border: 1px solid var(--ql-border);
+            border-radius: 999px;
+            background: var(--ql-bg-soft);
+            color: var(--ql-text);
+            font-size: 13px;
+            font-weight: 700;
+            line-height: 1;
+            cursor: pointer;
+            transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease;
+          }
+          .upgrader-step-btn:hover:not(:disabled) {
+            background: var(--ql-white-pill);
+            color: var(--ql-black-on-white);
+            border-color: var(--ql-white-pill);
+          }
+          .upgrader-step-btn:disabled {
+            opacity: 0.35;
+            cursor: default;
+          }
+          .upgrader-step-value {
+            flex: 0 0 auto;
+            min-width: 38px;
+            padding: 2px 2px;
+            border: 0;
+            border-radius: var(--ql-radius-sm);
+            background: transparent;
+            color: var(--ql-text-dim);
+            font-family: inherit;
+            font-size: 11px;
+            font-weight: 700;
+            text-align: center;
+            cursor: pointer;
+            transition: color 0.15s ease, background 0.15s ease;
+          }
+          .upgrader-step-value:hover {
+            background: var(--ql-bg-soft);
+            color: var(--ql-text);
+          }
           .upgrader-gui-row {
             display: flex;
             gap: 5px;
@@ -3073,8 +3126,49 @@ const ALLOWED_ITEM_TYPES = [
 
     // --- Skalowanie okna -----------------------------------------------------
 
+    // Panel skaluje sie przez transform z origin w lewym gornym rogu, wiec przy
+    // zmniejszaniu prawa/dolna krawedz odjezdza od krawedzi ekranu. Zapamietujemy
+    // do ktorej krawedzi panel byl "przyklejony" i odtwarzamy ten dystans.
+    getAnchorSnapshot(element) {
+      const rect = element.getBoundingClientRect();
+      const gapLeft = rect.left;
+      const gapRight = window.innerWidth - rect.right;
+      const gapTop = rect.top;
+      const gapBottom = window.innerHeight - rect.bottom;
+
+      return {
+        dockRight: gapRight <= gapLeft,
+        dockBottom: gapBottom <= gapTop,
+        gapRight,
+        gapBottom,
+        left: rect.left,
+        top: rect.top,
+      };
+    },
+
+    restoreAnchor(element, snapshot) {
+      if (!element || !snapshot) return;
+
+      const rect = element.getBoundingClientRect();
+      const left = snapshot.dockRight
+        ? window.innerWidth - rect.width - snapshot.gapRight
+        : snapshot.left;
+      const top = snapshot.dockBottom
+        ? window.innerHeight - rect.height - snapshot.gapBottom
+        : snapshot.top;
+
+      element.style.left = `${Math.round(left)}px`;
+      element.style.top = `${Math.round(top)}px`;
+      element.style.right = "auto";
+    },
+
     applyUiScale(value, options = {}) {
-      const { persist = true, render = true, keepInViewport = true } = options;
+      const {
+        persist = true,
+        render = true,
+        keepInViewport = true,
+        anchor = true,
+      } = options;
 
       const raw = Utils.clamp(
         Utils.toNumber(value, CONFIG.DEFAULT_UI_SCALE),
@@ -3086,8 +3180,14 @@ const ALLOWED_ITEM_TYPES = [
       state.uiScale = scale;
 
       const button = document.getElementById("upgrader-launcher");
+      const snapshot = button && anchor ? Ui.getAnchorSnapshot(button) : null;
+
       if (button) {
         button.style.setProperty("--ql-scale", String(scale));
+      }
+
+      if (snapshot) {
+        Ui.restoreAnchor(button, snapshot);
       }
 
       if (persist) {
@@ -3106,35 +3206,43 @@ const ALLOWED_ITEM_TYPES = [
     },
 
     renderScaleSettings() {
-      const slider = document.getElementById("upgrader-ui-scale");
       const label = document.getElementById("upgrader-ui-scale-value");
+      const minusButton = document.getElementById("upgrader-ui-scale-minus");
+      const plusButton = document.getElementById("upgrader-ui-scale-plus");
       const percent = Math.round(state.uiScale * 100);
-
-      if (slider && document.activeElement !== slider) {
-        slider.value = String(percent);
-      }
 
       if (label) {
         label.textContent = `${percent}%`;
       }
+
+      if (minusButton) {
+        minusButton.disabled = state.uiScale <= CONFIG.UI_SCALE_RANGE.min + 0.001;
+      }
+
+      if (plusButton) {
+        plusButton.disabled = state.uiScale >= CONFIG.UI_SCALE_RANGE.max - 0.001;
+      }
     },
 
+    // Zamiast suwaka - przyciski. Suwak skali siedzial wewnatrz skalowanego panelu,
+    // wiec w trakcie przeciagania uciekal spod kursora i wartosc skakala.
     bindScaleHandlers() {
-      const slider = document.getElementById("upgrader-ui-scale");
-      const resetButton = document.getElementById("upgrader-ui-scale-reset");
+      const stepScale = (direction) => {
+        Ui.applyUiScale(state.uiScale + direction * CONFIG.UI_SCALE_STEP);
+      };
 
-      if (slider) {
-        slider.addEventListener("input", () => {
-          Ui.applyUiScale(Utils.toNumber(slider.value, 100) / 100, {
-            persist: false,
-            render: true,
-            keepInViewport: false,
-          });
-        });
+      const minusButton = document.getElementById("upgrader-ui-scale-minus");
+      const plusButton = document.getElementById("upgrader-ui-scale-plus");
+      // Odczyt procentow jest jednoczesnie przyciskiem resetu - w waskiej
+      // kolumnie nie ma miejsca na osobny przycisk.
+      const resetButton = document.getElementById("upgrader-ui-scale-value");
 
-        slider.addEventListener("change", () => {
-          Ui.applyUiScale(Utils.toNumber(slider.value, 100) / 100);
-        });
+      if (minusButton) {
+        minusButton.addEventListener("click", () => stepScale(-1));
+      }
+
+      if (plusButton) {
+        plusButton.addEventListener("click", () => stepScale(1));
       }
 
       if (resetButton) {
@@ -3148,14 +3256,20 @@ const ALLOWED_ITEM_TYPES = [
     // CSS). Rozmiary czcionek zostaja bez zmian - od zmniejszania wszystkiego
     // naraz jest osobny suwak skali.
     applyDensity(density, options = {}) {
-      const { persist = true, render = true } = options;
+      const { persist = true, render = true, anchor = true } = options;
       const normalized = density === "cozy" ? "cozy" : "compact";
 
       state.density = normalized;
 
       const button = document.getElementById("upgrader-launcher");
+      const snapshot = button && anchor ? Ui.getAnchorSnapshot(button) : null;
+
       if (button) {
         button.classList.toggle("is-cozy", normalized === "cozy");
+      }
+
+      if (snapshot) {
+        Ui.restoreAnchor(button, snapshot);
       }
 
       if (persist) {
@@ -3206,10 +3320,10 @@ const ALLOWED_ITEM_TYPES = [
         const startScale = state.uiScale || CONFIG.DEFAULT_UI_SCALE;
         const rect = button.getBoundingClientRect();
 
-        // Rozmiar bazowy = rozmiar przed skalowaniem; dzieki temu przesuniecie
-        // uchwytu o N pikseli zmienia szerokosc panelu mniej wiecej o N pikseli.
+        // Rozmiar bazowy = rozmiar przy skali 1.
         const baseWidth = Math.max(1, rect.width / startScale);
         const baseHeight = Math.max(1, rect.height / startScale);
+        const diagonalSq = baseWidth * baseWidth + baseHeight * baseHeight;
 
         const startX = event.clientX;
         const startY = event.clientY;
@@ -3219,13 +3333,20 @@ const ALLOWED_ITEM_TYPES = [
         const onMouseMove = (moveEvent) => {
           const deltaX = moveEvent.clientX - startX;
           const deltaY = moveEvent.clientY - startY;
-          const nextScale =
-            startScale + (deltaX / baseWidth + deltaY / baseHeight) / 2;
 
+          // Rzut przesuniecia kursora na kierunek przekatnej panelu. Wczesniej
+          // bylo to (dx/w + dy/h) / 2, przez co rog przesuwal sie o polowe tego
+          // co kursor i "uciekal" spod myszy.
+          const nextScale =
+            startScale + (deltaX * baseWidth + deltaY * baseHeight) / diagonalSq;
+
+          // anchor: false - przy ciagnieciu uchwytu naturalnym punktem stalym
+          // jest lewy gorny rog, a nie krawedz ekranu.
           Ui.applyUiScale(nextScale, {
             persist: false,
             render: true,
             keepInViewport: false,
+            anchor: false,
           });
         };
 
@@ -3233,7 +3354,7 @@ const ALLOWED_ITEM_TYPES = [
           document.removeEventListener("mousemove", onMouseMove);
           document.removeEventListener("mouseup", onMouseUp);
           button.classList.remove("is-resizing");
-          Ui.applyUiScale(state.uiScale);
+          Ui.applyUiScale(state.uiScale, { anchor: false });
         };
 
         document.addEventListener("mousemove", onMouseMove);
@@ -4064,18 +4185,13 @@ const ALLOWED_ITEM_TYPES = [
                 <input id="upgrader-compact-mode" type="checkbox" />
               </label>
               <div class="upgrader-row">
-                <span>Skala <span id="upgrader-ui-scale-value" class="upgrader-row-value">100%</span></span>
-                <button id="upgrader-ui-scale-reset" class="upgrader-mini-btn" type="button" title="Przywróć 100%">Reset</button>
+                <span>Skala</span>
+                <span class="upgrader-stepper">
+                  <button id="upgrader-ui-scale-minus" class="upgrader-step-btn" type="button" title="Mniejszy panel">&minus;</button>
+                  <button id="upgrader-ui-scale-value" class="upgrader-step-value" type="button" title="Kliknij, aby przywrócić 100%">100%</button>
+                  <button id="upgrader-ui-scale-plus" class="upgrader-step-btn" type="button" title="Większy panel">+</button>
+                </span>
               </div>
-              <input
-                id="upgrader-ui-scale"
-                class="upgrader-slider"
-                type="range"
-                min="${Math.round(CONFIG.UI_SCALE_RANGE.min * 100)}"
-                max="${Math.round(CONFIG.UI_SCALE_RANGE.max * 100)}"
-                step="5"
-                value="100"
-              />
             </div>
           </div>
 
@@ -4093,11 +4209,16 @@ const ALLOWED_ITEM_TYPES = [
 
       document.body.appendChild(button);
 
-      Ui.applyDensity(state.density, { persist: false, render: false });
+      Ui.applyDensity(state.density, {
+        persist: false,
+        render: false,
+        anchor: false,
+      });
       Ui.applyUiScale(state.uiScale, {
         persist: false,
         render: false,
         keepInViewport: false,
+        anchor: false,
       });
       Ui.applyButtonPosition();
       Ui.ensureFloatingUiVisible();
