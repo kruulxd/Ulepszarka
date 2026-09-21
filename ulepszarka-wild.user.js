@@ -1,34 +1,43 @@
 // ==UserScript==
 // @name         ulepszator by Kruul
 // @namespace    http://tampermonkey.net/
-// @version      0.1.9
-// @description  Auto ulepszanie i rozbijanie
+// @version      0.2
+// @description  Auto ulepszanie
 // @author       Kruul
 // @match        https://*.margonem.pl/
-// @updateURL    https://raw.githubusercontent.com/kruulxd/Ulepszarka/main/ulepszarka-wild.user.js
-// @downloadURL  https://raw.githubusercontent.com/kruulxd/Ulepszarka/main/ulepszarka-wild.user.js
+// @updateURL    https://raw.githubusercontent.com/kruulxd/ulepszarka-demo/main/ulepszarka-wild.user.js
+// @downloadURL  https://raw.githubusercontent.com/kruulxd/ulepszarka-demo/main/ulepszarka-wild.user.js
 // @grant        none
 // ==/UserScript==
 
 const CONFIG = {
   DEFAULT_ALLOWED_RARITIES: ["common"],
   AVAILABLE_RARITIES: ["common", "unique", "heroic"],
-  DEFAULT_MODE: "enhancement",
-  AVAILABLE_MODES: ["enhancement", "salvage"],
+  RARITY_META: {
+    common: { label: "Zwykły", color: "#d4d4d8" },
+    unique: { label: "Unikat", color: "#eab308" },
+    heroic: { label: "Heroik", color: "#60a5fa" },
+    legendary: { label: "Legenda", color: "#f97316" },
+    artefact: { label: "Artefakt", color: "#a78bfa" },
+    upgrade: { label: "Ulepszenie", color: "#34d399" },
+  },
+  RARITY_BY_ITEM_TYPE: {
+    "t-com": "common",
+    "t-zwy": "common",
+    "t-uni": "unique",
+    "t-her": "heroic",
+    "t-leg": "legendary",
+    "t-art": "artefact",
+    "t-upg": "upgrade",
+  },
   MAX_REAGENTS: 25,
   DEFAULT_HOTKEYS: {
     enhance: "j",
-    salvage: "k",
     gui: "u",
   },
   DEFAULT_BUTTON_POSITION: {
     left: null,
     top: 150,
-    right: 16,
-  },
-  DEFAULT_PANEL_POSITION: {
-    left: null,
-    top: 188,
     right: 16,
   },
   DEFAULT_AUTO_SETTINGS: {
@@ -112,20 +121,18 @@ const ALLOWED_ITEM_TYPES = [
     enhanceCounter: null,
     dailyEnhancePoints: CONFIG.DAILY_POINTS_DEFAULT,
     enhancementProgressHooked: false,
-    salvageMessageHooked: false,
     lastProgressEventKey: null,
     lastProgressEventAt: 0,
     enhancementRunSummary: null,
-    salvageReceivedItems: [],
     isEnhancing: false,
-    mode: CONFIG.DEFAULT_MODE,
+    lastEnhanceProgress: null,
+    progressPeekTimer: null,
     lastAutoTriggerAt: 0,
     viewportSize: null,
     hasInterfaceWidget: false,
     interfaceWidgetDragObserver: null,
     launcherVisible: false,
     enhancementNotificationTimer: null,
-    salvageNotificationTimer: null,
   };
 
   const Utils = {
@@ -235,6 +242,19 @@ const ALLOWED_ITEM_TYPES = [
 
       const value = Utils.toNumber(match[0], NaN);
       return Number.isFinite(value) ? value : null;
+    },
+
+    parseProgressText(rawText) {
+      const text = String(rawText || "").trim();
+      if (!text || !text.includes("/")) return null;
+
+      const [rawCurrent, rawTarget] = text.split("/");
+      const current = Utils.toNumber(String(rawCurrent).replace(/[^\d]/g, ""), NaN);
+      const target = Utils.toNumber(String(rawTarget).replace(/[^\d]/g, ""), NaN);
+
+      if (!Number.isFinite(current) || !Number.isFinite(target)) return null;
+
+      return { current, target };
     },
 
     getEnhancePreviewPoints() {
@@ -415,10 +435,6 @@ const ALLOWED_ITEM_TYPES = [
       return `upgrader-button-position-charId-${Engine.hero.d.id}`;
     },
 
-    getPanelPositionKey() {
-      return `upgrader-panel-position-charId-${Engine.hero.d.id}`;
-    },
-
     getWidgetSlotKey() {
       return `upgrader-widget-slot-charId-${Engine.hero.d.id}`;
     },
@@ -429,10 +445,6 @@ const ALLOWED_ITEM_TYPES = [
 
     getBoundSettingsKey() {
       return `upgrader-bound-settings-charId-${Engine.hero.d.id}`;
-    },
-
-    getModeKey() {
-      return `upgrader-mode-charId-${Engine.hero.d.id}`;
     },
 
     getEnhanceCounterKey() {
@@ -507,27 +519,13 @@ const ALLOWED_ITEM_TYPES = [
           return { ...CONFIG.DEFAULT_HOTKEYS };
         }
 
-        const hasLegacyExtract = Object.prototype.hasOwnProperty.call(
-          parsed,
-          "extract"
-        );
-        const hasSalvage = Object.prototype.hasOwnProperty.call(parsed, "salvage");
-        const legacySalvageHotkey = parsed?.salvage ?? parsed?.extract;
         const normalized = {
           enhance: Utils.normalizeHotkey(
             parsed?.enhance,
             CONFIG.DEFAULT_HOTKEYS.enhance
           ),
-          salvage: Utils.normalizeHotkey(
-            legacySalvageHotkey,
-            CONFIG.DEFAULT_HOTKEYS.salvage
-          ),
           gui: Utils.normalizeHotkey(parsed?.gui, CONFIG.DEFAULT_HOTKEYS.gui),
         };
-
-        if (hasLegacyExtract && !hasSalvage) {
-          Storage.setHotkeys(normalized);
-        }
 
         return normalized;
       } catch (error) {
@@ -540,10 +538,6 @@ const ALLOWED_ITEM_TYPES = [
         enhance: Utils.normalizeHotkey(
           hotkeys?.enhance,
           CONFIG.DEFAULT_HOTKEYS.enhance
-        ),
-        salvage: Utils.normalizeHotkey(
-          hotkeys?.salvage,
-          CONFIG.DEFAULT_HOTKEYS.salvage
         ),
         gui: Utils.normalizeHotkey(hotkeys?.gui, CONFIG.DEFAULT_HOTKEYS.gui),
       };
@@ -599,55 +593,6 @@ const ALLOWED_ITEM_TYPES = [
 
       window.localStorage.setItem(
         Storage.getGuiPositionKey(),
-        JSON.stringify(normalized)
-      );
-
-      return normalized;
-    },
-
-    getPanelPosition() {
-      const saved = window.localStorage.getItem(Storage.getPanelPositionKey());
-      if (!saved) {
-        return { ...CONFIG.DEFAULT_PANEL_POSITION };
-      }
-
-      try {
-        const parsed = JSON.parse(saved);
-        return {
-          left:
-            typeof parsed?.left === "number"
-              ? parsed.left
-              : CONFIG.DEFAULT_PANEL_POSITION.left,
-          top:
-            typeof parsed?.top === "number"
-              ? parsed.top
-              : CONFIG.DEFAULT_PANEL_POSITION.top,
-          right:
-            typeof parsed?.right === "number"
-              ? parsed.right
-              : CONFIG.DEFAULT_PANEL_POSITION.right,
-        };
-      } catch (error) {
-        return { ...CONFIG.DEFAULT_PANEL_POSITION };
-      }
-    },
-
-    setPanelPosition(position) {
-      const normalized = {
-        left:
-          typeof position?.left === "number" ? Math.round(position.left) : null,
-        top:
-          typeof position?.top === "number"
-            ? Math.round(position.top)
-            : CONFIG.DEFAULT_PANEL_POSITION.top,
-        right:
-          typeof position?.right === "number"
-            ? Math.round(position.right)
-            : CONFIG.DEFAULT_PANEL_POSITION.right,
-      };
-
-      window.localStorage.setItem(
-        Storage.getPanelPositionKey(),
         JSON.stringify(normalized)
       );
 
@@ -769,30 +714,6 @@ const ALLOWED_ITEM_TYPES = [
         JSON.stringify(normalized)
       );
 
-      return normalized;
-    },
-
-    getMode() {
-      const saved = window.localStorage.getItem(Storage.getModeKey());
-      if (!saved) {
-        return CONFIG.DEFAULT_MODE;
-      }
-
-      if (saved === "extraction") {
-        return "salvage";
-      }
-
-      return CONFIG.AVAILABLE_MODES.includes(saved)
-        ? saved
-        : CONFIG.DEFAULT_MODE;
-    },
-
-    setMode(mode) {
-      const normalized = CONFIG.AVAILABLE_MODES.includes(mode)
-        ? mode
-        : CONFIG.DEFAULT_MODE;
-
-      window.localStorage.setItem(Storage.getModeKey(), normalized);
       return normalized;
     },
 
@@ -987,163 +908,6 @@ const ALLOWED_ITEM_TYPES = [
     },
   };
 
-  const SalvageApi = {
-    clickNode(node) {
-      if (!node) return false;
-      const eventInit = { bubbles: true, cancelable: true };
-      node.dispatchEvent(new MouseEvent("mousedown", eventInit));
-      node.dispatchEvent(new MouseEvent("mouseup", eventInit));
-      node.dispatchEvent(new MouseEvent("click", eventInit));
-      return true;
-    },
-
-    async waitForRemovedCount(itemIds = [], attempts = 12, delay = 110) {
-      let removedCount = 0;
-      for (let attempt = 0; attempt < attempts; attempt += 1) {
-        await Utils.sleep(delay);
-        removedCount = itemIds.reduce(
-          (acc, id) => acc + (Engine.items.getItemById(id) ? 0 : 1),
-          0
-        );
-        if (removedCount > 0) break;
-      }
-      return removedCount;
-    },
-
-    async runDirectSalvageBatch(itemIds = []) {
-      const availableItemIds = itemIds.filter((itemId) =>
-        Boolean(Engine.items.getItemById(itemId))
-      );
-      if (availableItemIds.length === 0) return 0;
-      if (typeof _g !== "function") return 0;
-
-      const selectedItems = availableItemIds.join(",");
-
-      await new Promise((resolve) => {
-        _g(`salvager&action=salvage&selectedItems=${selectedItems}`, () => {
-          resolve();
-        });
-      });
-
-      return SalvageApi.waitForRemovedCount(availableItemIds, 14, 90);
-    },
-
-    async submitAndConfirmSalvage() {
-      const submitButton =
-        document.querySelector(".salvage__submit .button.small.green") ||
-        document.querySelector(".salvage__submit .button");
-      if (!SalvageApi.clickNode(submitButton)) return false;
-
-      for (let attempt = 0; attempt < 12; attempt += 1) {
-        await Utils.sleep(80);
-        const confirmButton =
-          document.querySelector(
-            ".window-controlls .button.small.alert-accept-hotkey"
-          ) ||
-          document.querySelector(".window-controlls .alert-accept-hotkey");
-        if (!confirmButton) continue;
-        SalvageApi.clickNode(confirmButton);
-        return true;
-      }
-
-      return false;
-    },
-
-    async runUiSalvagePass(itemIds = []) {
-      const passItems = itemIds.filter((itemId) => Boolean(Engine.items.getItemById(itemId)));
-      if (passItems.length === 0) return 0;
-
-      const tabReady = await Ui.ensureCraftingModeTab();
-      if (!tabReady) return 0;
-
-      for (const itemId of passItems) {
-        const itemNode = document.querySelector(`.item-id-${itemId}`);
-        if (!itemNode) continue;
-        SalvageApi.clickNode(itemNode);
-        await Utils.sleep(95);
-      }
-
-      await Utils.sleep(230);
-
-      const confirmed = await SalvageApi.submitAndConfirmSalvage();
-      if (!confirmed) return 0;
-
-      const removedInPass = await SalvageApi.waitForRemovedCount(passItems, 16, 120);
-
-      for (let attempt = 0; attempt < 25; attempt += 1) {
-        await Utils.sleep(100);
-        const stillActive = document.querySelector(".salvage__submit .button.small.green");
-        if (!stillActive) break;
-      }
-
-      return removedInPass;
-    },
-
-    async salvageItemsBatchThroughUi(itemIds = []) {
-      const availableItemIds = itemIds.filter((itemId) =>
-        Boolean(Engine.items.getItemById(itemId))
-      );
-      if (availableItemIds.length === 0) return 0;
-
-      const directRemoved = await SalvageApi.runDirectSalvageBatch(
-        availableItemIds
-      );
-      if (directRemoved > 0) {
-        return directRemoved;
-      }
-
-      let removedTotal = 0;
-      let pendingItemIds = [...availableItemIds];
-      let noProgressPasses = 0;
-      let adaptiveChunkSize = Math.min(12, pendingItemIds.length);
-
-      for (let pass = 0; pass < 50; pass += 1) {
-        pendingItemIds = pendingItemIds.filter((id) => Boolean(Engine.items.getItemById(id)));
-        if (pendingItemIds.length === 0) break;
-
-        const currentChunkSize = Math.max(1, Math.min(adaptiveChunkSize, pendingItemIds.length));
-        const passItemIds = pendingItemIds.slice(0, currentChunkSize);
-        const removedInPass = await SalvageApi.runUiSalvagePass(passItemIds);
-
-        pendingItemIds = pendingItemIds.filter((id) => Boolean(Engine.items.getItemById(id)));
-        removedTotal += removedInPass;
-
-        if (removedInPass <= 0) {
-          noProgressPasses += 1;
-          adaptiveChunkSize = Math.max(1, Math.floor(currentChunkSize / 2));
-        } else {
-          noProgressPasses = 0;
-
-          if (removedInPass < passItemIds.length) {
-            adaptiveChunkSize = Math.max(1, Math.floor(currentChunkSize / 2));
-          } else if (currentChunkSize < 12) {
-            adaptiveChunkSize = Math.min(12, currentChunkSize + 1);
-          }
-        }
-
-        if (noProgressPasses >= 6) break;
-      }
-
-      pendingItemIds = pendingItemIds.filter((id) => Boolean(Engine.items.getItemById(id)));
-      if (pendingItemIds.length > 0) {
-        for (const itemId of pendingItemIds) {
-          if (!Engine.items.getItemById(itemId)) continue;
-
-          const removedSingle = await SalvageApi.runUiSalvagePass([itemId]);
-          removedTotal += removedSingle;
-
-          if (!Engine.items.getItemById(itemId)) {
-            continue;
-          }
-
-          const retryRemovedSingle = await SalvageApi.runUiSalvagePass([itemId]);
-          removedTotal += retryRemovedSingle;
-        }
-      }
-
-      return removedTotal;
-    },
-  };
 
   const Inventory = {
     isTruthyStatValue(value) {
@@ -1438,10 +1202,6 @@ const ALLOWED_ITEM_TYPES = [
       return [...new Set(reagents)];
     },
 
-    getItemsForSalvage() {
-      return Inventory.getReagents();
-    },
-
     getFreeSlotsInfo() {
       const candidates = [];
       const EXCLUDED_BAG_SLOT_SELECTOR = ".bag-4-slot";
@@ -1615,6 +1375,27 @@ const ALLOWED_ITEM_TYPES = [
   const Ui = {
     setupCss() {
       const css = `
+      :root {
+        --ql-bg: rgba(13, 13, 15, 0.97);
+        --ql-bg-soft: rgba(255, 255, 255, 0.04);
+        --ql-bg-softer: rgba(255, 255, 255, 0.02);
+        --ql-border: rgba(255, 255, 255, 0.08);
+        --ql-border-strong: rgba(255, 255, 255, 0.14);
+        --ql-text: #f2f2f3;
+        --ql-text-dim: #9a9aa0;
+        --ql-text-mute: #6b6b70;
+        --ql-white-pill: #f4f4f5;
+        --ql-white-pill-hover: #e4e4e7;
+        --ql-black-on-white: #18181b;
+        --ql-green: #4ade80;
+        --ql-red: #f87171;
+        --ql-blue: #60a5fa;
+        --ql-orange: #fb923c;
+        --ql-radius-sm: 6px;
+        --ql-radius-md: 10px;
+        --ql-radius-lg: 14px;
+        --ql-font: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      }
       .upgrader-crafting-window {
         display: none !important;
       }
@@ -1627,11 +1408,11 @@ const ALLOWED_ITEM_TYPES = [
       .widget-button.widget-upgrader-addon {
         cursor: pointer;
         overflow: hidden;
-        background: linear-gradient(145deg, rgba(24, 32, 74, 0.96), rgba(43, 21, 84, 0.96)) !important;
-        border-color: rgba(111, 76, 198, 0.7) !important;
+        background: var(--ql-bg) !important;
+        border-color: var(--ql-border-strong) !important;
       }
       .widget-button.widget-upgrader-addon::before {
-        box-shadow: inset 0 0 1px 1px rgba(111, 76, 198, 0.7) !important;
+        box-shadow: inset 0 0 0 1px var(--ql-border-strong) !important;
       }
       .widget-button.widget-upgrader-addon .icon.upgrader-widget-icon {
         display: flex;
@@ -1648,11 +1429,11 @@ const ALLOWED_ITEM_TYPES = [
         height: auto !important;
         padding: 0;
         overflow: hidden;
-        border-radius: 4px;
+        border-radius: var(--ql-radius-sm);
         transform: none !important;
-        font-weight: 800;
+        font-weight: 600;
         font-size: 14px;
-        color: #ffffff;
+        color: var(--ql-text);
         background-image: url("https://micc.garmory-cdn.cloud/obrazki/npc/e2/trist2_wabicielka-1a.gif") !important;
         background-repeat: no-repeat !important;
         background-position: calc(50% + 2px) 50% !important;
@@ -1666,17 +1447,16 @@ const ALLOWED_ITEM_TYPES = [
       }
       .upgrader-launcher,
       .upgrader-launcher *,
-      .upgrader-gui-panel,
-      .upgrader-gui-panel *,
       .upgrader-label,
       .menu-item--yellow {
-        font-family: "Segoe UI Variable", "Segoe UI", "Trebuchet MS", Tahoma, sans-serif !important;
+        font-family: var(--ql-font) !important;
       }
       .menu-item--yellow {
-        background: linear-gradient(90deg, #7c5caf, #a87ddc) !important;
-        color: #fff !important;
-        border-radius: 5px !important;
+        background: var(--ql-white-pill) !important;
+        color: var(--ql-black-on-white) !important;
+        border-radius: var(--ql-radius-sm) !important;
         padding: 5px !important;
+        font-weight: 600 !important;
       }
       .upgrader-label {
           position: absolute;
@@ -1685,196 +1465,307 @@ const ALLOWED_ITEM_TYPES = [
           height: 16px;
           width: 32px;
           text-align: center;
-          color: yellow;
+          color: var(--ql-green);
           pointer-events: none;
-          text-shadow: -2px 0 black, 0 2px black, 2px 0 black, 0 -2px black;
+          text-shadow: -1px 0 black, 0 1px black, 1px 0 black, 0 -1px black;
           font-size: 0.75rem;
+          font-weight: 700;
       }
           .upgrader-launcher {
             position: fixed;
             right: 16px;
             top: 150px;
-            width: 146px;
-            z-index: 99998;
-            border: 1px solid rgba(130, 75, 180, 0.4);
-            border-radius: 10px;
-            background: linear-gradient(180deg, rgba(15,10,35,1), rgba(80,45,140,1));
-            color: #e6eef8;
-            cursor: url(https://pub-05e2f98fb5b34633ae42c4866ef64081.r2.dev/assets/img/cursor/1n.png), auto;
-            font-weight: 700;
-            font-family: "Segoe UI Variable", "Segoe UI", "Trebuchet MS", Tahoma, sans-serif;
-            box-shadow: 0 8px 24px rgba(2, 6, 23, 0.6);
+            width: 226px;
+            z-index: 99999;
+            border: 1px solid var(--ql-border);
+            border-radius: var(--ql-radius-lg);
+            background: var(--ql-bg);
+            color: var(--ql-text);
+            cursor: default;
+            font-weight: 500;
+            font-family: var(--ql-font);
+            box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
             user-select: none;
-            padding: 6px;
+            padding: 12px;
             box-sizing: border-box;
+            transition: width 0.28s cubic-bezier(0.4, 0, 0.2, 1);
           }
-          .upgrader-launcher-title {
-            font-size: 13px;
-            font-weight: 800;
-            letter-spacing: 0.3px;
-            text-transform: uppercase;
-            text-align: center;
-            cursor: move;
-            color: #c4a0f7;
+          .upgrader-launcher.is-expanded {
+            width: 380px;
           }
-          .upgrader-launcher-counter {
-            margin-top: 4px;
-            margin-bottom: 3px;
-            text-align: center;
-            font-size: 10px;
-            color: #9aa6bf;
-          }
-          .upgrader-launcher-points {
-            margin-bottom: 6px;
-            text-align: center;
-            font-size: 10px;
-            color: #b7c3dd;
-          }
-          .upgrader-launcher-mode {
-            margin-bottom: 6px;
-            text-align: center;
-            font-size: 10px;
-            font-weight: 800;
-            letter-spacing: 0.25px;
-            text-transform: uppercase;
-          }
-          .upgrader-launcher-mode--enhancement {
-            color: #8fd9ff;
-          }
-          .upgrader-launcher-mode--salvage {
-            color: #ffcf8b;
-          }
-          .upgrader-launcher-counter--good {
-            color: #88d27a;
-          }
-          .upgrader-launcher-counter--mid {
-            color: #f0dc71;
-          }
-          .upgrader-launcher-counter--low {
-            color: #ff8d8d;
-          }
-          .upgrader-launcher-row {
-            display: grid;
-            grid-template-columns: 1fr 1fr;
-            gap: 4px;
-          }
-          .upgrader-launcher-btn {
-            border: 1px solid rgba(91, 140, 255, 0.28);
-            border-radius: 6px;
-            background: rgba(255,255,255,0.03);
-            color: #e6eef8;
-            height: 24px;
-            font-size: 10px;
-            font-weight: 700;
-            cursor: url(https://pub-05e2f98fb5b34633ae42c4866ef64081.r2.dev/assets/img/cursor/1n.png), auto;
-          }
-          .upgrader-launcher-btn:hover {
-            background: linear-gradient(90deg, rgba(100,60,160,0.35), rgba(130,75,180,0.35));
-            border-color: rgba(130,75,180,0.6);
-          }
-          .upgrader-gui-panel {
-            position: fixed;
-            right: 16px;
-            top: 188px;
-            width: 260px;
-            z-index: 11;
-            border: 1px solid rgba(130, 75, 180, 0.35);
-            border-radius: 12px;
-            background: linear-gradient(180deg, rgba(15,10,35,0.96), rgba(80,45,140,0.94));
-            backdrop-filter: blur(2px);
-            color: #e6eef8;
-            padding: 8px;
-            display: none;
-            box-sizing: border-box;
-            overflow: visible;
-            user-select: none;
-            font-family: "Segoe UI Variable", "Segoe UI", "Trebuchet MS", Tahoma, sans-serif;
-            cursor: url(https://pub-05e2f98fb5b34633ae42c4866ef64081.r2.dev/assets/img/cursor/1n.png), auto;
-            box-shadow: 0 10px 30px rgba(2, 6, 23, 0.7);
-          }
-          .upgrader-gui-title {
-            position: relative;
+          .upgrader-launcher-header {
             display: flex;
             align-items: center;
-            font-size: 14px;
+            gap: 6px;
+            margin: -12px -12px 10px -12px;
+            padding: 11px 12px;
+          }
+          .upgrader-launcher-gear {
+            flex: 0 0 auto;
+            width: 22px;
+            height: 22px;
+            padding: 0;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            border: 1px solid var(--ql-border);
+            border-radius: 999px;
+            background: var(--ql-bg-soft);
+            color: var(--ql-text-dim);
+            cursor: pointer;
+            transition: background 0.15s ease, color 0.15s ease;
+          }
+          .upgrader-launcher-gear svg {
+            width: 13px;
+            height: 13px;
+            transition: transform 0.28s ease;
+          }
+          .upgrader-launcher.is-expanded .upgrader-launcher-gear svg {
+            transform: rotate(75deg);
+          }
+          .upgrader-launcher-gear:hover {
+            background: var(--ql-white-pill);
+            color: var(--ql-black-on-white);
+          }
+          .upgrader-launcher-title {
+            flex: 1 1 auto;
+            font-size: 16px;
+            font-weight: 800;
+            letter-spacing: 0.2px;
+            text-align: center;
+            cursor: move;
+            color: var(--ql-text);
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+          }
+          .upgrader-launcher-stock {
+            flex: 0 0 auto;
+            font-size: 10px;
+            font-weight: 700;
+            color: var(--ql-text-dim);
+            background: var(--ql-bg-soft);
+            border: 1px solid var(--ql-border);
+            border-radius: 999px;
+            padding: 2px 7px;
+            min-width: 10px;
+            text-align: center;
+          }
+          .upgrader-launcher-item-wrap {
+            margin-bottom: 8px;
+          }
+          .upgrader-launcher-item-box {
+            width: 100%;
+            height: 46px;
+            border: 1px solid var(--ql-border);
+            border-radius: var(--ql-radius-md);
+            background: var(--ql-bg-softer);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            overflow: hidden;
+            box-sizing: border-box;
+          }
+          .upgrader-launcher-item-box-empty {
+            font-size: 10px;
+            color: var(--ql-text-mute);
+            text-align: center;
+            padding: 0 6px;
+          }
+          .upgrader-launcher-progress-wrap {
+            margin-bottom: 8px;
+          }
+          .upgrader-launcher-progress-track {
+            position: relative;
+            width: 100%;
+            height: 20px;
+            border-radius: 999px;
+            border: 1px solid var(--ql-border);
+            background: rgba(255, 255, 255, 0.06);
+            box-shadow: inset 0 2px 4px rgba(0, 0, 0, 0.45);
+            overflow: hidden;
+            box-sizing: border-box;
+          }
+          .upgrader-launcher-progress-fill {
+            position: absolute;
+            inset: 0;
+            width: 0%;
+            background:
+              repeating-linear-gradient(
+                45deg,
+                rgba(255, 255, 255, 0.16) 0px,
+                rgba(255, 255, 255, 0.16) 7px,
+                transparent 7px,
+                transparent 14px
+              ),
+              linear-gradient(180deg, rgba(255, 255, 255, 0.22), transparent 55%),
+              linear-gradient(90deg, rgba(21, 128, 61, 0.9), rgba(74, 222, 128, 0.95));
+            background-size: 20px 20px, 100% 100%, 100% 100%;
+            background-repeat: repeat, no-repeat, no-repeat;
+            animation: ql-progress-stripes 1s linear infinite;
+            transition: width 0.25s ease;
+            overflow: hidden;
+          }
+          .upgrader-launcher-progress-fill::after {
+            content: "";
+            position: absolute;
+            top: 0;
+            right: 0;
+            bottom: 0;
+            width: 10px;
+            background: rgba(255, 255, 255, 0.75);
+            filter: blur(3px);
+            opacity: 0.85;
+          }
+          @keyframes ql-progress-stripes {
+            from {
+              background-position: 0 0, 0 0, 0 0;
+            }
+            to {
+              background-position: 20px 0, 0 0, 0 0;
+            }
+          }
+          .upgrader-launcher-progress-label {
+            position: relative;
+            z-index: 1;
+            height: 100%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 9px;
+            font-weight: 700;
+            color: var(--ql-text);
+            text-shadow: 0 1px 2px rgba(0, 0, 0, 0.65);
+            padding: 0 4px;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+          }
+          .upgrader-launcher-counter {
+            margin-bottom: 10px;
+            text-align: center;
+            font-size: 10px;
+            font-weight: 700;
+            line-height: 1.35;
+            color: var(--ql-red);
+          }
+          .upgrader-launcher-counter--good {
+            color: var(--ql-green);
+          }
+          .upgrader-launcher-counter--mid {
+            color: #eab308;
+          }
+          .upgrader-launcher-counter--low {
+            color: var(--ql-red);
+          }
+          .upgrader-launcher-main-btn {
+            display: block;
+            width: 100%;
+            height: 32px;
+            border: 1px solid var(--ql-border);
+            border-radius: 999px;
+            background: var(--ql-bg-soft);
+            color: var(--ql-text);
+            font-size: 12px;
             font-weight: 800;
             letter-spacing: 0.3px;
-            margin-bottom: 6px;
-            cursor: move;
-            padding: 3px 22px 3px 2px;
-            border-bottom: 1px solid rgba(130,75,180,0.3);
-            color: #c4a0f7;
-          }
-          .upgrader-gui-close-btn {
-            position: absolute;
-            top: 50%;
-            right: 0;
-            transform: translateY(-50%);
-            width: 18px;
-            height: 18px;
-            border: 1px solid rgba(91,140,255,0.3);
-            border-radius: 5px;
-            background: rgba(255,255,255,0.03);
-            color: #e6eef8;
-            font-size: 12px;
-            font-weight: 700;
-            line-height: 1;
             cursor: pointer;
-            padding: 0;
+            transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease;
           }
-          .upgrader-gui-close-btn:hover {
-            background: linear-gradient(90deg, rgba(100,60,160,0.35), rgba(130,75,180,0.35));
-            border-color: rgba(130,75,180,0.6);
+          .upgrader-launcher-main-btn:hover {
+            background: var(--ql-white-pill);
+            color: var(--ql-black-on-white);
+            border-color: var(--ql-white-pill);
+          }
+          .upgrader-settings-body {
+            max-height: 0;
+            opacity: 0;
+            overflow: hidden;
+            margin-top: 0;
+            transition: max-height 0.32s cubic-bezier(0.4, 0, 0.2, 1),
+              opacity 0.22s ease, margin-top 0.28s ease;
+          }
+          .upgrader-launcher.is-expanded .upgrader-settings-body {
+            max-height: 900px;
+            opacity: 1;
+            margin-top: 12px;
+          }
+          .upgrader-grid-3 {
+            display: grid;
+            grid-template-columns: 1fr 1fr 1fr;
+            gap: 10px;
+            margin-top: 10px;
+          }
+          .upgrader-card {
+            border: 1px solid var(--ql-border);
+            border-radius: var(--ql-radius-md);
+            padding: 10px;
+            background: var(--ql-bg-softer);
+            box-sizing: border-box;
+            min-width: 0;
+          }
+          .upgrader-card-title {
+            font-size: 11px;
+            font-weight: 700;
+            letter-spacing: 0.3px;
+            text-transform: uppercase;
+            color: var(--ql-text-dim);
+            margin-bottom: 7px;
+          }
+          .upgrader-gui-rarity-list-col {
+            flex-direction: column;
+            gap: 7px;
           }
           .upgrader-gui-row {
             display: flex;
-            gap: 6px;
-            margin-top: 6px;
+            gap: 7px;
+            margin-top: 10px;
           }
           .upgrader-gui-btn {
-            border: 1px solid rgba(91,140,255,0.28);
-            border-radius: 6px;
-            background: rgba(255,255,255,0.03);
-            color: #e6eef8;
-            height: 26px;
-            cursor: url(https://pub-05e2f98fb5b34633ae42c4866ef64081.r2.dev/assets/img/cursor/1n.png), auto;
-          }
-          .upgrader-gui-btn {
-            padding: 0 8px;
+            border: 1px solid var(--ql-border);
+            border-radius: 999px;
+            background: var(--ql-bg-soft);
+            color: var(--ql-text);
+            height: 34px;
             cursor: pointer;
-            font-size: 11px;
+          }
+          .upgrader-gui-btn {
+            padding: 0 12px;
+            cursor: pointer;
+            font-size: 12px;
             font-weight: 700;
+            flex: 1;
+            transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease;
           }
           .upgrader-gui-btn:hover {
-            background: linear-gradient(90deg, rgba(100,60,160,0.35), rgba(130,75,180,0.35));
-            border-color: rgba(130,75,180,0.6);
+            background: var(--ql-white-pill);
+            color: var(--ql-black-on-white);
+            border-color: var(--ql-white-pill);
           }
             .upgrader-select-hint {
-              margin-top: 6px;
-              border: 1px solid rgba(91,140,255,0.18);
-              border-radius: 6px;
-              padding: 6px;
-              background: rgba(255,255,255,0.02);
-              font-size: 10px;
-              color: #9aa6bf;
-            }
-            .upgrader-selected-preview-wrap {
-              margin-top: 6px;
-              border: 1px solid rgba(91,140,255,0.18);
-              border-radius: 6px;
-              padding: 6px;
-              background: rgba(255,255,255,0.02);
+              margin-top: 10px;
+              border: 1px solid var(--ql-border);
+              border-radius: var(--ql-radius-md);
+              padding: 10px;
+              background: var(--ql-bg-softer);
+              font-size: 11px;
+              line-height: 1.4;
+              color: var(--ql-text-dim);
             }
             .upgrader-selected-preview-box {
-              min-height: 40px;
+              min-height: 48px;
               display: flex;
               align-items: center;
-              gap: 6px;
+              gap: 10px;
               position: relative;
             }
             .upgrader-selected-preview-item {
               width: 32px;
               height: 32px;
+              box-sizing: border-box;
+              border: 1px solid var(--ql-rarity-color, var(--ql-border));
+              box-shadow: 0 0 6px -1px var(--ql-rarity-glow, transparent);
+              background: rgba(255, 255, 255, 0.03);
               position: relative !important;
               left: 0 !important;
               top: 0 !important;
@@ -1885,183 +1776,97 @@ const ALLOWED_ITEM_TYPES = [
               display: block !important;
               flex: 0 0 auto;
               overflow: hidden;
-            }
-            .upgrader-selected-preview-item .highlight {
-              position: absolute !important;
-              top: 0 !important;
-              left: 0 !important;
-              width: 32px !important;
-              height: 32px !important;
-              pointer-events: none;
-              z-index: 0;
+              border-radius: var(--ql-radius-sm);
             }
             .upgrader-selected-preview-icon {
-              width: 32px;
-              height: 32px;
+              width: 100%;
+              height: 100%;
               display: block;
               flex: 0 0 auto;
-              image-rendering: auto;
+              image-rendering: pixelated;
+              object-fit: contain;
               position: relative;
               z-index: 1;
             }
-            .upgrader-selected-preview-text {
-              font-size: 11px;
-              font-weight: 600;
-              color: #e6eef8;
-              word-break: break-word;
-            }
             .upgrader-gui-rarity-wrap {
-              margin-top: 6px;
-              border: 1px solid rgba(91,140,255,0.18);
-              border-radius: 6px;
-              padding: 6px;
-              background: rgba(255,255,255,0.02);
-            }
-            .upgrader-mode-wrap {
-              margin-top: 6px;
-              border: 1px solid rgba(91,140,255,0.22);
-              border-radius: 8px;
-              padding: 8px;
-              background: linear-gradient(180deg, rgba(100,60,160,0.1), rgba(130,75,180,0.08));
-            }
-            .upgrader-mode-row {
-              display: flex;
-              align-items: center;
-              justify-content: space-between;
-              gap: 10px;
-            }
-            .upgrader-mode-label {
-              font-size: 12px;
-              font-weight: 800;
-              color: #dbe7ff;
-              letter-spacing: 0.2px;
-            }
-            .upgrader-mode-value {
-              display: inline-flex;
-              align-items: center;
-              justify-content: center;
-              min-width: 96px;
-              font-size: 11px;
-              font-weight: 800;
-              text-transform: uppercase;
-            }
-            .upgrader-mode-value--enhancement {
-              color: #8fd9ff;
-            }
-            .upgrader-mode-value--salvage {
-              color: #ffcf8b;
-            }
-            .upgrader-mode-switch {
-              position: relative;
-              display: inline-flex;
-              width: 46px;
-              height: 24px;
-              cursor: pointer;
-            }
-            .upgrader-mode-switch input {
-              opacity: 0;
-              width: 0;
-              height: 0;
-            }
-            .upgrader-mode-slider {
-              position: absolute;
-              inset: 0;
-              border-radius: 24px;
-              border: 1px solid rgba(91,140,255,0.35);
-              background: rgba(91,140,255,0.25);
-              box-sizing: border-box;
-              overflow: hidden;
-              transition: background 0.2s ease, border-color 0.2s ease;
-            }
-            .upgrader-mode-slider::before {
-              content: "";
-              position: absolute;
-              width: 18px;
-              height: 18px;
-              left: 2px;
-              top: 2px;
-              border-radius: 50%;
-              background: #f7fbff;
-              box-shadow: 0 1px 4px rgba(0,0,0,0.28);
-              transition: transform 0.2s ease;
-            }
-            .upgrader-mode-switch input:checked + .upgrader-mode-slider {
-              background: rgba(245,158,11,0.35);
-              border-color: rgba(245,158,11,0.6);
-            }
-            .upgrader-mode-switch input:checked + .upgrader-mode-slider::before {
-              transform: translateX(14px);
+              margin-top: 10px;
+              border: 1px solid var(--ql-border);
+              border-radius: var(--ql-radius-md);
+              padding: 10px;
+              background: var(--ql-bg-softer);
             }
             .upgrader-gui-rarity-title {
               font-size: 12px;
-              font-weight: 800;
-              letter-spacing: 0.2px;
-              margin-bottom: 4px;
-              color: #c9d8ef;
+              font-weight: 700;
+              letter-spacing: 0.3px;
+              text-transform: uppercase;
+              margin-bottom: 7px;
+              color: var(--ql-text-dim);
             }
             .upgrader-gui-rarity-list {
               display: flex;
-              gap: 8px;
+              gap: 12px;
               flex-wrap: wrap;
             }
             .upgrader-gui-rarity-item {
               display: inline-flex;
               align-items: center;
-              gap: 4px;
-              font-size: 11px;
+              gap: 6px;
+              font-size: 12px;
+              color: var(--ql-text);
             }
             .upgrader-rarity-common {
-              color: #9b9b9b;
+              color: var(--ql-text-dim);
             }
             .upgrader-rarity-unique {
-              color: #f0dc71;
+              color: #eab308;
             }
             .upgrader-rarity-heroic {
-              color: #7fb6ff;
+              color: var(--ql-blue);
             }
             .upgrader-bound-wrap {
-              margin-top: 6px;
-              border: 1px solid rgba(91,140,255,0.18);
-              border-radius: 6px;
-              padding: 6px;
-              background: rgba(255,255,255,0.02);
+              margin-top: 10px;
+              border: 1px solid var(--ql-border);
+              border-radius: var(--ql-radius-md);
+              padding: 10px;
+              background: var(--ql-bg-softer);
             }
             .upgrader-bound-item {
               display: flex;
               align-items: center;
               justify-content: space-between;
-              gap: 10px;
-              font-size: 11px;
-              color: #e6eef8;
-              margin-bottom: 4px;
+              gap: 12px;
+              font-size: 12px;
+              color: var(--ql-text);
+              margin-bottom: 7px;
             }
             .upgrader-bound-item span:first-child {
-              font-weight: 600;
+              font-weight: 500;
             }
             .upgrader-bound-item:last-child {
               margin-bottom: 0;
             }
             .upgrader-bound-warning {
-              margin-top: 4px;
-              font-size: 10px;
-              color: #ff9e9e;
+              margin-top: 5px;
+              font-size: 11px;
+              color: var(--ql-red);
               display: inline-flex;
               align-items: center;
-              gap: 6px;
+              gap: 7px;
             }
             .upgrader-tooltip-trigger {
               position: relative;
               display: inline-flex;
               align-items: center;
               justify-content: center;
-              width: 14px;
-              height: 14px;
+              width: 16px;
+              height: 16px;
               border-radius: 50%;
-              border: 1px solid rgba(91,140,255,0.45);
-              color: #cfd9ef;
-              font-size: 10px;
+              border: 1px solid var(--ql-border-strong);
+              color: var(--ql-text-dim);
+              font-size: 11px;
               line-height: 1;
-              background: rgba(255,255,255,0.04);
+              background: var(--ql-bg-soft);
               cursor: help;
             }
             .upgrader-tooltip-trigger[data-tooltip]:hover::after {
@@ -2070,74 +1875,106 @@ const ALLOWED_ITEM_TYPES = [
               left: 0;
               bottom: calc(100% + 6px);
               max-width: 220px;
-              padding: 6px 8px;
-              border-radius: 6px;
-              border: 1px solid rgba(91,140,255,0.3);
-              background: linear-gradient(180deg, rgba(7,16,40,0.96), rgba(11,18,32,0.96));
-              color: #e6eef8;
+              padding: 7px 10px;
+              border-radius: var(--ql-radius-sm);
+              border: 1px solid var(--ql-border);
+              background: #0a0a0b;
+              color: var(--ql-text);
               font-size: 10px;
               line-height: 1.35;
               white-space: normal;
               z-index: 15;
-              box-shadow: 0 8px 24px rgba(2,6,23,0.6);
+              box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
               pointer-events: none;
             }
             .upgrader-hotkeys-wrap {
-              margin-top: 6px;
-              border: 1px solid rgba(91,140,255,0.18);
-              border-radius: 6px;
-              padding: 6px;
-              background: rgba(255,255,255,0.02);
+              margin-top: 10px;
+              border: 1px solid var(--ql-border);
+              border-radius: var(--ql-radius-md);
+              padding: 10px;
+              background: var(--ql-bg-softer);
             }
             .upgrader-hotkeys-grid {
               display: grid;
               grid-template-columns: 1fr 38px;
-              gap: 4px;
+              gap: 7px;
+              align-items: center;
             }
             .upgrader-hotkeys-label {
-              font-size: 11px;
-              font-weight: 600;
-              color: #c9d8ef;
+              font-size: 12px;
+              font-weight: 500;
+              color: var(--ql-text-dim);
               align-self: center;
             }
             .upgrader-hotkeys-input {
-              border: 1px solid rgba(91,140,255,0.28);
-              border-radius: 4px;
-              background: rgba(255,255,255,0.03);
-              color: #e6eef8;
-              height: 22px;
+              font-size: 12px;
+              font-weight: 700;
+              border: 1px solid var(--ql-border-strong);
+              border-radius: var(--ql-radius-sm);
+              background: var(--ql-bg-soft);
+              color: var(--ql-text);
+              height: 29px;
               text-align: center;
-              cursor: url(https://pub-05e2f98fb5b34633ae42c4866ef64081.r2.dev/assets/img/cursor/1n.png), auto;
+              cursor: pointer;
             }
             .upgrader-auto-wrap {
-              margin-top: 6px;
-              border: 1px solid rgba(91,140,255,0.18);
-              border-radius: 6px;
-              padding: 6px;
-              background: rgba(255,255,255,0.02);
+              margin-top: 10px;
+              border: 1px solid var(--ql-border);
+              border-radius: var(--ql-radius-md);
+              padding: 10px;
+              background: var(--ql-bg-softer);
             }
             .upgrader-auto-row {
               display: flex;
               align-items: center;
               justify-content: space-between;
-              gap: 6px;
-              margin-bottom: 6px;
-              font-size: 11px;
-              color: #e6eef8;
+              gap: 7px;
+              margin-bottom: 10px;
+              font-size: 12px;
+              color: var(--ql-text);
             }
             .upgrader-auto-row label {
-              font-weight: 600;
+              font-weight: 500;
             }
             .upgrader-auto-slider {
               width: 100%;
+              accent-color: var(--ql-text);
             }
             .upgrader-auto-slider:disabled {
-              opacity: 0.45;
+              opacity: 0.4;
             }
             .upgrader-auto-info {
-              margin-top: 4px;
-              font-size: 10px;
-              color: #9aa6bf;
+              margin-top: 5px;
+              font-size: 11px;
+              color: var(--ql-text-dim);
+            }
+            .upgrader-launcher input[type="checkbox"] {
+              appearance: none;
+              -webkit-appearance: none;
+              width: 16px;
+              height: 16px;
+              border-radius: 4px;
+              border: 1px solid var(--ql-border-strong);
+              background: var(--ql-bg-soft);
+              cursor: pointer;
+              flex: 0 0 auto;
+              position: relative;
+              transition: background 0.15s ease, border-color 0.15s ease;
+            }
+            .upgrader-launcher input[type="checkbox"]:checked {
+              background: var(--ql-white-pill);
+              border-color: var(--ql-white-pill);
+            }
+            .upgrader-launcher input[type="checkbox"]:checked::after {
+              content: "";
+              position: absolute;
+              left: 5px;
+              top: 1px;
+              width: 4px;
+              height: 8px;
+              border: solid var(--ql-black-on-white);
+              border-width: 0 2px 2px 0;
+              transform: rotate(45deg);
             }
     `;
 
@@ -2173,68 +2010,16 @@ const ALLOWED_ITEM_TYPES = [
 
     prepareEnhancementWindow() {
       const wasOpenBeforeRun = Ui.isCraftingWindowOpen();
-      const hideCssClass =
-        state.mode === "salvage" ? null : "upgrader-crafting-window";
+      const hideCssClass = "upgrader-crafting-window";
 
       if (!wasOpenBeforeRun) {
-        if (hideCssClass) {
-          Engine.crafting.window.wnd.$.addClass(hideCssClass);
-        }
+        Engine.crafting.window.wnd.$.addClass(hideCssClass);
         Engine.interface.clickCrafting();
       } else {
-        if (hideCssClass) {
-          Engine.crafting.window.wnd.$.addClass(hideCssClass);
-        }
+        Engine.crafting.window.wnd.$.addClass(hideCssClass);
       }
-
-      Ui.ensureCraftingModeTab();
 
       return { wasOpenBeforeRun, hideCssClass };
-    },
-
-    async ensureCraftingModeTab() {
-      if (state.mode !== "salvage") {
-        return true;
-      }
-
-      for (let attempt = 0; attempt < 8; attempt += 1) {
-        const salvageTab =
-          document.querySelector(
-            '.one-item-on-divide-list.crafting-recipe-in-list[data-tab-id="salvage"]'
-          ) ||
-          document.querySelector(
-            '.one-item-on-divide-list.crafting-recipe-in-list[data-tab-id="extraction"]'
-          );
-
-        if (!salvageTab) {
-          await Utils.sleep(80);
-          continue;
-        }
-
-        salvageTab.dispatchEvent(
-          new MouseEvent("mousedown", { bubbles: true, cancelable: true })
-        );
-        salvageTab.dispatchEvent(
-          new MouseEvent("mouseup", { bubbles: true, cancelable: true })
-        );
-        salvageTab.dispatchEvent(
-          new MouseEvent("click", { bubbles: true, cancelable: true })
-        );
-
-        await Utils.sleep(90);
-
-        const isActive =
-          salvageTab.classList.contains("active") ||
-          salvageTab.classList.contains("selected") ||
-          salvageTab.classList.contains("crafting-recipe-in-list-active") ||
-          salvageTab.getAttribute("aria-selected") === "true";
-
-        if (isActive) {
-          return true;
-        }
-      }
-
-      return false;
     },
 
     restoreEnhancementWindow(session = {}) {
@@ -2267,58 +2052,151 @@ const ALLOWED_ITEM_TYPES = [
       $(`.item-id-${upgradedItemId}`).append(label);
     },
 
-    renderSelectedItemPreview() {
-      const previewBox = document.getElementById("upgrader-selected-preview-box");
-      const previewText = document.getElementById("upgrader-selected-preview-text");
-      if (!previewBox || !previewText) return;
+    resolveItemIconUrl(item) {
+      const icon =
+        item?.icon || item?.tpl?.icon || item?._cachedStats?.icon || "";
+      if (!icon || typeof icon !== "string") return "";
+      if (/^(data:|https?:|\/\/)/.test(icon)) return icon;
 
-      previewBox.innerHTML = "";
+      const base =
+        window.CFG?.item_dir ||
+        window.Engine?.item_dir ||
+        "https://micc.garmory-cdn.cloud/obrazki/itemy/";
+
+      return `${String(base).replace(/\/?$/, "/")}${icon.replace(/^\//, "")}`;
+    },
+
+    buildIconDataUrlFromCanvas(sourceCanvas) {
+      const SIZE = 32;
+      const sourceWidth = sourceCanvas?.width || 0;
+      const sourceHeight = sourceCanvas?.height || 0;
+      if (!sourceWidth || !sourceHeight) return "";
+
+      try {
+        const canvas = document.createElement("canvas");
+        canvas.width = SIZE;
+        canvas.height = SIZE;
+        const context = canvas.getContext("2d");
+        if (!context) return "";
+
+        context.imageSmoothingEnabled = false;
+
+        const scale = Math.min(SIZE / sourceWidth, SIZE / sourceHeight);
+        const drawWidth = Math.max(1, Math.round(sourceWidth * scale));
+        const drawHeight = Math.max(1, Math.round(sourceHeight * scale));
+        const offsetX = Math.round((SIZE - drawWidth) / 2);
+        const offsetY = Math.round((SIZE - drawHeight) / 2);
+
+        context.drawImage(
+          sourceCanvas,
+          0,
+          0,
+          sourceWidth,
+          sourceHeight,
+          offsetX,
+          offsetY,
+          drawWidth,
+          drawHeight
+        );
+
+        return canvas.toDataURL("image/png");
+      } catch (error) {
+        return "";
+      }
+    },
+
+    resolveItemRarity(item, sourceNode) {
+      const fromStats = item?._cachedStats?.rarity;
+      if (fromStats && CONFIG.RARITY_META[fromStats]) return fromStats;
+
+      const itemType = sourceNode?.getAttribute?.("data-item-type");
+      if (itemType && CONFIG.RARITY_BY_ITEM_TYPE[itemType]) {
+        return CONFIG.RARITY_BY_ITEM_TYPE[itemType];
+      }
+
+      return fromStats || "";
+    },
+
+    applyRarityStyling(rarity) {
+      const wrap = document.getElementById("upgrader-launcher-item-box");
+      const meta = CONFIG.RARITY_META[rarity];
+
+      if (wrap) {
+        if (meta) {
+          wrap.style.setProperty("--ql-rarity-color", meta.color);
+          wrap.style.setProperty("--ql-rarity-glow", `${meta.color}59`);
+        } else {
+          wrap.style.removeProperty("--ql-rarity-color");
+          wrap.style.removeProperty("--ql-rarity-glow");
+        }
+      }
+    },
+
+    buildItemIconNode(item, sourceNode) {
+      if (!item) return null;
+
+      const sourceCanvas = sourceNode?.querySelector?.("canvas.icon.canvas-icon");
+      const canvasFallback = Ui.buildIconDataUrlFromCanvas(sourceCanvas);
+      const iconUrl = Ui.resolveItemIconUrl(item);
+
+      if (!canvasFallback && !iconUrl) return null;
+
+      const previewItem = document.createElement("div");
+      previewItem.className = "upgrader-selected-preview-item";
+
+      const iconPreview = document.createElement("img");
+      iconPreview.className = "upgrader-selected-preview-icon";
+      iconPreview.alt = item.name || "Wybrany przedmiot";
+
+      if (iconUrl) {
+        iconPreview.src = iconUrl;
+        if (canvasFallback) {
+          iconPreview.onerror = () => {
+            iconPreview.onerror = null;
+            iconPreview.src = canvasFallback;
+          };
+        }
+      } else {
+        iconPreview.src = canvasFallback;
+      }
+
+      previewItem.appendChild(iconPreview);
+      return previewItem;
+    },
+
+    renderSelectedItemPreview() {
+      const launcherBox = document.getElementById("upgrader-launcher-item-box");
+      if (!launcherBox) return;
+
+      launcherBox.innerHTML = "";
+      launcherBox.removeAttribute("title");
+
+      const setEmptyState = (message) => {
+        const empty = document.createElement("div");
+        empty.className = "upgrader-launcher-item-box-empty";
+        empty.textContent = message;
+        launcherBox.appendChild(empty);
+        Ui.applyRarityStyling("");
+      };
 
       const selectedId = Storage.getUpgradedItemId();
       if (!selectedId) {
-        previewText.textContent = "Brak wybranego przedmiotu";
+        setEmptyState("Brak przedmiotu");
         return;
       }
 
       const item = Engine.items.getItemById(selectedId);
       if (!item) {
-        previewText.textContent = `Wybrany ID: ${selectedId} (poza plecakiem)`;
+        setEmptyState(`ID: ${selectedId} (poza plecakiem)`);
         return;
       }
 
       const sourceNode = document.querySelector(`.item-id-${selectedId}`);
-      if (sourceNode) {
-        const sourceCanvas = sourceNode.querySelector("canvas.icon.canvas-icon");
-        const sourceHighlight = sourceNode.querySelector(".highlight");
+      const iconNode = Ui.buildItemIconNode(item, sourceNode);
+      if (iconNode) launcherBox.appendChild(iconNode);
 
-        if (sourceCanvas) {
-          const previewItem = document.createElement("div");
-          previewItem.className = "upgrader-selected-preview-item item";
-
-          const iconPreview = document.createElement("img");
-          iconPreview.className = "upgrader-selected-preview-icon";
-          iconPreview.alt = item.name || "Wybrany przedmiot";
-          iconPreview.src = sourceCanvas.toDataURL("image/png");
-
-          previewItem.appendChild(iconPreview);
-
-          if (sourceHighlight) {
-            const highlightPreview = sourceHighlight.cloneNode(true);
-            const highlightStyles = window.getComputedStyle(sourceHighlight);
-
-            highlightPreview.style.backgroundImage = highlightStyles.backgroundImage;
-            highlightPreview.style.backgroundPosition = highlightStyles.backgroundPosition;
-            highlightPreview.style.backgroundSize = highlightStyles.backgroundSize;
-            highlightPreview.style.backgroundRepeat = highlightStyles.backgroundRepeat;
-
-            previewItem.appendChild(highlightPreview);
-          }
-
-          previewBox.appendChild(previewItem);
-        }
-      }
-
-      previewText.textContent = item.name;
+      if (item.name) launcherBox.title = item.name;
+      Ui.applyRarityStyling(Ui.resolveItemRarity(item, sourceNode));
     },
 
     clearUpgradedItem() {
@@ -2348,13 +2226,16 @@ const ALLOWED_ITEM_TYPES = [
       );
 
       if (!counter) {
-        counterNode.textContent = "Limit: --/--";
+        counterNode.textContent = "LIMIT: --/--";
         return;
       }
 
       state.enhanceCounter = counter.text;
       Storage.setEnhanceCounter(counter.text);
-      counterNode.textContent = `Limit: ${counter.text}`;
+
+      const dailyPoints = Storage.getDailyEnhancePoints();
+      state.dailyEnhancePoints = dailyPoints;
+      counterNode.textContent = `LIMIT: ${counter.text} (${Utils.formatPoints(dailyPoints)})`;
 
       const ratio = counter.current / counter.limit;
       if (ratio <= 0.2) {
@@ -2373,6 +2254,60 @@ const ALLOWED_ITEM_TYPES = [
       const currentPoints = Storage.getDailyEnhancePoints();
       state.dailyEnhancePoints = currentPoints;
       pointsNode.textContent = `Punkty dziś: ${Utils.formatPoints(currentPoints)}`;
+    },
+
+    refreshEnhanceProgress() {
+      const fill = document.getElementById("upgrader-launcher-progress-fill");
+      const label = document.getElementById("upgrader-launcher-progress-label");
+      if (!fill || !label) return;
+
+      const upgradedItemId = Storage.getUpgradedItemId();
+
+      const source = document.querySelector(
+        ".enhance__progress-text.enhance__progress-text--current"
+      );
+      const freshProgress = Utils.parseProgressText(source?.textContent);
+
+      if (freshProgress) {
+        state.lastEnhanceProgress = {
+          itemId: upgradedItemId,
+          current: freshProgress.current,
+          target: freshProgress.target,
+        };
+      }
+
+      const cached = state.lastEnhanceProgress;
+      const progress =
+        cached && cached.itemId === upgradedItemId
+          ? { current: cached.current, target: cached.target }
+          : null;
+
+      if (!progress) {
+        fill.style.width = "0%";
+        label.textContent = "-- / --";
+        return;
+      }
+
+      const percent = progress.target > 0
+        ? Utils.clamp(Math.round((progress.current / progress.target) * 100), 0, 100)
+        : 0;
+
+      fill.style.width = `${percent}%`;
+      label.textContent = `${Utils.formatPoints(progress.current)} / ${Utils.formatPoints(progress.target)} (${percent}%)`;
+    },
+
+    refreshReagentStock() {
+      const stockNode = document.getElementById("upgrader-launcher-stock");
+      if (!stockNode) return;
+
+      let count = 0;
+      try {
+        count = Inventory.getReagents().length;
+      } catch (error) {
+        count = 0;
+      }
+
+      stockNode.textContent = String(count);
     },
 
     renderAutoSettings() {
@@ -2410,15 +2345,11 @@ const ALLOWED_ITEM_TYPES = [
           enabled: toggle.checked,
         });
 
-        const autoModeLabel = state.mode === "salvage" ? "rozbijanie" : "ulepszanie";
-        const autoModeLabelCapitalized =
-          state.mode === "salvage" ? "Auto rozbijanie" : "Auto ulepszanie";
-
         Ui.renderAutoSettings();
         message(
           state.autoSettings.enabled
-            ? `${autoModeLabelCapitalized} włączone (próg: ${state.autoSettings.minFreeSlots} wolnych slotów)`
-            : `${autoModeLabelCapitalized} wyłączone`
+            ? `Auto ulepszanie włączone (próg: ${state.autoSettings.minFreeSlots} wolnych slotów)`
+            : "Auto ulepszanie wyłączone"
         );
       });
 
@@ -2432,11 +2363,9 @@ const ALLOWED_ITEM_TYPES = [
           minFreeSlots: slider.value,
         });
 
-        const autoModeLabel = state.mode === "salvage" ? "rozbijania" : "ulepszania";
-
         Ui.renderAutoSettings();
         message(
-          `Zapisano próg auto-${autoModeLabel}: ${state.autoSettings.minFreeSlots} wolnych slotów`
+          `Zapisano próg auto-ulepszania: ${state.autoSettings.minFreeSlots} wolnych slotów`
         );
       });
     },
@@ -2498,7 +2427,7 @@ const ALLOWED_ITEM_TYPES = [
         input.className = "upgrader-rarity-checkbox";
         input.value = rarity;
         input.checked = selectedRarities.includes(rarity);
-        input.disabled = state.mode === "salvage" && rarity === "heroic";
+        input.disabled = false;
 
         const span = document.createElement("span");
   span.textContent = rarityMeta[rarity]?.label || rarity;
@@ -2510,88 +2439,25 @@ const ALLOWED_ITEM_TYPES = [
       });
     },
 
-    enforceSafeRaritiesForMode(showMessage = false) {
-      if (state.mode !== "salvage") {
-        return;
-      }
-
-      const selected = Storage.getAllowedRarities();
-      if (!selected.includes("heroic")) {
-        return;
-      }
-
-      const withoutHeroic = selected.filter((rarity) => rarity !== "heroic");
-      Storage.setAllowedRarities(withoutHeroic);
-
-      if (showMessage) {
-        message("W trybie rozbijania heroiki są automatycznie wyłączone.");
-      }
-    },
-
-    renderModeSwitch() {
-      const modeToggle = document.getElementById("upgrader-mode-toggle");
-      const modeValue = document.getElementById("upgrader-mode-value");
-      if (!modeToggle || !modeValue) return;
-
-      const isSalvage = state.mode === "salvage";
-      modeToggle.checked = isSalvage;
-      modeValue.textContent = isSalvage ? "ROZBIJANIE" : "ULEPSZANIE";
-      modeValue.className = `upgrader-mode-value ${
-        isSalvage
-          ? "upgrader-mode-value--salvage"
-          : "upgrader-mode-value--enhancement"
-      }`;
-    },
-
     renderModeDependentTexts() {
       const manualButton = document.getElementById("upgrader-launcher-enhance-btn");
-      const launcherMode = document.getElementById("upgrader-launcher-mode");
       const hint = document.getElementById("upgrader-select-hint");
       const autoLabel = document.getElementById("upgrader-auto-label");
-      const previewWrap = document.getElementById("upgrader-selected-preview-wrap");
 
-      const isSalvage = state.mode === "salvage";
+      const hotkeys = state.hotkeys || CONFIG.DEFAULT_HOTKEYS;
+      const activeHotkey = (hotkeys.enhance || "").toUpperCase();
 
       if (manualButton) {
-        manualButton.textContent = isSalvage ? "ROZBIJ" : "ULEPSZ";
-      }
-
-      if (launcherMode) {
-        launcherMode.textContent = isSalvage ? "Tryb: rozbijanie" : "Tryb: ulepszanie";
-        launcherMode.className = `upgrader-launcher-mode ${
-          isSalvage
-            ? "upgrader-launcher-mode--salvage"
-            : "upgrader-launcher-mode--enhancement"
-        }`;
+        manualButton.textContent = activeHotkey ? `ULEPSZ (${activeHotkey})` : "ULEPSZ";
       }
 
       if (hint) {
-        hint.textContent = isSalvage
-          ? "Tryb rozbijania: addon użyje wybranych rzadkości i rozbije pasujące przedmioty."
-          : "Wybór przedmiotu: kliknij PPM na itemie i użyj opcji „Ulepsz ten przedmiot”.";
+        hint.textContent = "Wybór przedmiotu: kliknij PPM na itemie i użyj opcji „Ulepsz ten przedmiot”.";
       }
 
       if (autoLabel) {
-        autoLabel.textContent = isSalvage ? "Auto rozbijanie" : "Auto ulepszanie";
+        autoLabel.textContent = "Auto ulepszanie";
       }
-
-      if (previewWrap) {
-        previewWrap.style.display = isSalvage ? "none" : "block";
-      }
-    },
-
-    bindModeHandlers() {
-      const modeToggle = document.getElementById("upgrader-mode-toggle");
-      if (!modeToggle) return;
-
-      modeToggle.addEventListener("change", () => {
-        state.mode = Storage.setMode(modeToggle.checked ? "salvage" : "enhancement");
-        Ui.enforceSafeRaritiesForMode(true);
-        Ui.renderModeSwitch();
-        Ui.renderModeDependentTexts();
-        Ui.renderRarityOptions();
-
-      });
     },
 
     getSelectedRaritiesFromGui() {
@@ -2601,24 +2467,20 @@ const ALLOWED_ITEM_TYPES = [
 
     renderHotkeyInputs() {
       const enhanceInput = document.getElementById("upgrader-hotkey-enhance");
-      const salvageInput = document.getElementById("upgrader-hotkey-salvage");
       const guiInput = document.getElementById("upgrader-hotkey-gui");
-      if (!enhanceInput || !salvageInput || !guiInput) return;
+      if (!enhanceInput || !guiInput) return;
 
       const hotkeys = state.hotkeys || { ...CONFIG.DEFAULT_HOTKEYS };
       enhanceInput.value = hotkeys.enhance;
-      salvageInput.value = hotkeys.salvage;
       guiInput.value = hotkeys.gui;
     },
 
     getHotkeysFromGui() {
       const enhanceInput = document.getElementById("upgrader-hotkey-enhance");
-      const salvageInput = document.getElementById("upgrader-hotkey-salvage");
       const guiInput = document.getElementById("upgrader-hotkey-gui");
 
       return {
         enhance: enhanceInput?.value,
-        salvage: salvageInput?.value,
         gui: guiInput?.value,
       };
     },
@@ -2654,39 +2516,6 @@ const ALLOWED_ITEM_TYPES = [
       button.style.right = "auto";
 
       Storage.setGuiPosition({ left: finalLeft, top: finalTop, right: null });
-    },
-
-    applyPanelPosition() {
-      const panel = document.getElementById("upgrader-gui-panel");
-      if (!panel) return;
-
-      const position = Storage.getPanelPosition();
-      panel.style.top = `${position.top}px`;
-
-      if (typeof position.left === "number") {
-        panel.style.left = `${position.left}px`;
-        panel.style.right = "auto";
-      } else {
-        panel.style.left = "auto";
-        panel.style.right = `${position.right}px`;
-      }
-    },
-
-    savePanelPosition(left, top) {
-      const panel = document.getElementById("upgrader-gui-panel");
-      if (!panel) return;
-
-      const maxLeft = Math.max(window.innerWidth - panel.offsetWidth, 0);
-      const maxTop = Math.max(window.innerHeight - panel.offsetHeight, 0);
-
-      const finalLeft = Utils.clamp(left, 0, maxLeft);
-      const finalTop = Utils.clamp(top, 0, maxTop);
-
-      panel.style.left = `${finalLeft}px`;
-      panel.style.top = `${finalTop}px`;
-      panel.style.right = "auto";
-
-      Storage.setPanelPosition({ left: finalLeft, top: finalTop, right: null });
     },
 
     keepElementInViewport(element, fallbackPosition = {}) {
@@ -2818,29 +2647,6 @@ const ALLOWED_ITEM_TYPES = [
           });
         }
       }
-
-      const panel = document.getElementById("upgrader-gui-panel");
-      if (panel) {
-        if (resizeMeta) {
-          Ui.keepElementRelativeOnResize(
-            panel,
-            Storage.getPanelPosition(),
-            resizeMeta
-          );
-        } else {
-          Ui.keepElementInViewport(panel, Storage.getPanelPosition());
-        }
-
-        const panelLeft = Utils.toNumber(parseFloat(panel.style.left), NaN);
-        const panelTop = Utils.toNumber(parseFloat(panel.style.top), NaN);
-        if (Number.isFinite(panelLeft) && Number.isFinite(panelTop)) {
-          Storage.setPanelPosition({
-            left: Math.round(panelLeft),
-            top: Math.round(panelTop),
-            right: null,
-          });
-        }
-      }
     },
 
     initViewportResizeHandler() {
@@ -2883,12 +2689,18 @@ const ALLOWED_ITEM_TYPES = [
 
     initButtonDrag() {
       const button = document.getElementById("upgrader-launcher");
-      const handle = document.getElementById("upgrader-launcher-title");
+      const handle = document.getElementById("upgrader-launcher-header");
       if (!button || !handle) return;
 
       handle.addEventListener("mousedown", (event) => {
         if (event.button !== 0) return;
-        if (event.target?.closest?.("#upgrader-gui-close-btn")) return;
+        if (
+          event.target?.closest?.(
+            "#upgrader-launcher-config-btn, #upgrader-launcher-stock"
+          )
+        ) {
+          return;
+        }
 
         event.preventDefault();
 
@@ -2900,36 +2712,6 @@ const ALLOWED_ITEM_TYPES = [
           const nextLeft = moveEvent.clientX - offsetX;
           const nextTop = moveEvent.clientY - offsetY;
           Ui.saveButtonPosition(nextLeft, nextTop);
-        };
-
-        const onMouseUp = () => {
-          document.removeEventListener("mousemove", onMouseMove);
-          document.removeEventListener("mouseup", onMouseUp);
-        };
-
-        document.addEventListener("mousemove", onMouseMove);
-        document.addEventListener("mouseup", onMouseUp);
-      });
-    },
-
-    initPanelDrag() {
-      const panel = document.getElementById("upgrader-gui-panel");
-      const handle = document.getElementById("upgrader-gui-title");
-      if (!panel || !handle) return;
-
-      handle.addEventListener("mousedown", (event) => {
-        if (event.button !== 0) return;
-
-        event.preventDefault();
-
-        const panelRect = panel.getBoundingClientRect();
-        const offsetX = event.clientX - panelRect.left;
-        const offsetY = event.clientY - panelRect.top;
-
-        const onMouseMove = (moveEvent) => {
-          const nextLeft = moveEvent.clientX - offsetX;
-          const nextTop = moveEvent.clientY - offsetY;
-          Ui.savePanelPosition(nextLeft, nextTop);
         };
 
         const onMouseUp = () => {
@@ -3463,11 +3245,6 @@ const ALLOWED_ITEM_TYPES = [
           return;
         }
 
-        if (state.mode === "salvage" && target.value === "heroic" && target.checked) {
-          target.checked = false;
-          return;
-        }
-
         const selectedRarities = Ui.getSelectedRaritiesFromGui();
         if (selectedRarities.length === 0) {
           target.checked = true;
@@ -3654,92 +3431,26 @@ const ALLOWED_ITEM_TYPES = [
       }, 3500);
     },
 
-    showSalvageCompletionNotification(data) {
-      const notificationId = "upgrader-salvage-notification";
-      let notification = document.getElementById(notificationId);
-
-      // Anuluj poprzedni timer jeśli istnieje
-      if (state.salvageNotificationTimer) {
-        clearTimeout(state.salvageNotificationTimer);
-        state.salvageNotificationTimer = null;
-      }
-
-      if (!notification) {
-        notification = document.createElement("div");
-        notification.id = notificationId;
-        notification.style.cssText = `
-          position: fixed;
-          top: 30%;
-          left: 50%;
-          transform: translate(-50%, -50%) scale(0.9);
-          z-index: 99999;
-          min-width: 320px;
-          max-width: 420px;
-          padding: 24px 32px;
-          border-radius: 16px;
-          background: linear-gradient(135deg, rgba(35,15,10,0.98) 0%, rgba(140,60,45,0.96) 50%, rgba(180,90,75,0.95) 100%);
-          backdrop-filter: blur(10px);
-          box-shadow: 0 20px 60px rgba(140,60,45,0.6), 0 0 0 1px rgba(247,120,85,0.3), inset 0 1px 0 rgba(255,255,255,0.2);
-          color: #ffffff;
-          font-family: "Segoe UI Variable", "Segoe UI", "Trebuchet MS", Tahoma, sans-serif;
-          text-align: center;
-          pointer-events: none;
-          opacity: 0;
-          transition: all 0.4s cubic-bezier(0.34, 1.56, 0.64, 1);
-        `;
-        document.body.appendChild(notification);
-      }
-
-      // Resetuj stan powiadomienia
-      notification.style.opacity = "0";
-      notification.style.transform = "translate(-50%, -50%) scale(0.9)";
-
-      const remainingInfo = data.remainingItems > 0 
-        ? `<div style="font-size: 13px; font-weight: 500; margin-top: 14px; opacity: 0.85; color: #ffd7cc; padding: 8px 16px; background: rgba(0,0,0,0.2); border-radius: 8px;">
-             ⚠️ Zostało ${data.remainingItems} przedmiotów<br/>
-             <span style="font-size: 11px; opacity: 0.8;">nie udało się ich już zaznaczyć</span>
-           </div>`
-        : `<div style="font-size: 13px; font-weight: 600; margin-top: 14px; opacity: 0.9; color: #a7f3d0;">
-             ✓ Wszystko rozbite pomyślnie!
-           </div>`;
-
-      notification.innerHTML = `
-        <div style="font-size: 11px; font-weight: 600; letter-spacing: 2px; text-transform: uppercase; margin-bottom: 10px; opacity: 0.85; color: #ffd7cc;">
-          🔨 Rozbijanie zakończone
-        </div>
-        <div style="font-size: 32px; font-weight: 900; margin-bottom: 14px; text-shadow: 0 3px 12px rgba(0,0,0,0.4); line-height: 1.2; letter-spacing: -0.5px; color: #fbbf24;">
-          ${data.count}
-        </div>
-        <div style="font-size: 16px; font-weight: 600; margin-bottom: 8px; opacity: 0.95; color: #ffd7cc;">
-          ${data.count === 1 ? 'przedmiot rozbity' : 'przedmiotów rozbitych'}
-        </div>
-        ${remainingInfo}
-      `;
-
-      requestAnimationFrame(() => {
-        notification.style.opacity = "1";
-        notification.style.transform = "translate(-50%, -50%) scale(1)";
-      });
-
-      state.salvageNotificationTimer = setTimeout(() => {
-        notification.style.opacity = "0";
-        notification.style.transform = "translate(-50%, -60%) scale(0.95)";
-        state.salvageNotificationTimer = null;
-      }, 3500);
-    },
-
     toggleGui() {
-      const panel = document.getElementById("upgrader-gui-panel");
-      if (!panel) return;
+      const widget = document.getElementById("upgrader-launcher");
+      if (!widget) return;
+
+      const rect = widget.getBoundingClientRect();
+      widget.style.left = `${Math.round(rect.left)}px`;
+      widget.style.right = "auto";
 
       state.guiVisible = !state.guiVisible;
-      panel.style.display = state.guiVisible ? "block" : "none";
+      widget.classList.toggle("is-expanded", state.guiVisible);
+
+      const gear = document.getElementById("upgrader-launcher-config-btn");
+      if (gear) {
+        const label = state.guiVisible ? "Zwiń ustawienia" : "Rozwiń ustawienia";
+        gear.setAttribute("aria-label", label);
+        gear.title = label;
+      }
 
       if (state.guiVisible) {
-        Ui.enforceSafeRaritiesForMode();
-        Ui.renderModeSwitch();
         Ui.renderModeDependentTexts();
-        Ui.applyPanelPosition();
         Ui.renderSelectedItemPreview();
         Ui.renderRarityOptions();
         Ui.renderBoundSettings();
@@ -3756,111 +3467,107 @@ const ALLOWED_ITEM_TYPES = [
       button.id = "upgrader-launcher";
       button.className = "upgrader-launcher";
       button.innerHTML = `
-        <div id="upgrader-launcher-title" class="upgrader-launcher-title">QuickForge</div>
-        <div id="upgrader-launcher-counter" class="upgrader-launcher-counter">Limit: --</div>
-        <div id="upgrader-launcher-points" class="upgrader-launcher-points">Punkty dziś: 0</div>
-        <div id="upgrader-launcher-mode" class="upgrader-launcher-mode upgrader-launcher-mode--enhancement">Tryb: ulepszanie</div>
-        <div class="upgrader-launcher-row">
-          <button id="upgrader-launcher-config-btn" class="upgrader-launcher-btn">CONFIG</button>
-          <button id="upgrader-launcher-enhance-btn" class="upgrader-launcher-btn">ULEPSZ</button>
+        <div id="upgrader-launcher-header" class="upgrader-launcher-header">
+          <button id="upgrader-launcher-config-btn" class="upgrader-launcher-gear" type="button" aria-label="Ustawienia" title="Ustawienia dodatku">
+            <svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+              <path d="M12 15.5a3.5 3.5 0 100-7 3.5 3.5 0 000 7z" stroke="currentColor" stroke-width="1.6"/>
+              <path d="M19.4 13a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 11-2.83 2.83l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V19a2 2 0 11-4 0v-.09a1.65 1.65 0 00-1-1.51 1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 11-2.83-2.83l.06-.06a1.65 1.65 0 00.33-1.82 1.65 1.65 0 00-1.51-1H4a2 2 0 110-4h.09a1.65 1.65 0 001.51-1 1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 112.83-2.83l.06.06a1.65 1.65 0 001.82.33H10a1.65 1.65 0 001-1.51V4a2 2 0 114 0v.09a1.65 1.65 0 001 1.51 1.65 1.65 0 001.82-.33l.06-.06a2 2 0 112.83 2.83l-.06.06a1.65 1.65 0 00-.33 1.82V10a1.65 1.65 0 001.51 1H20a2 2 0 110 4h-.09a1.65 1.65 0 00-1.51 1z" stroke="currentColor" stroke-width="1.6"/>
+            </svg>
+          </button>
+          <div id="upgrader-launcher-title" class="upgrader-launcher-title">Quick Forge</div>
+          <div id="upgrader-launcher-stock" class="upgrader-launcher-stock" title="Ilość przedmiotów możliwych do wrzucenia teraz">0</div>
         </div>
-      `;
 
-      const panel = document.createElement("div");
-      panel.id = "upgrader-gui-panel";
-      panel.className = "upgrader-gui-panel";
-      panel.innerHTML = `
-        <div id="upgrader-gui-title" class="upgrader-gui-title">
-          <span>QuickForge - ustawienia</span>
-          <button id="upgrader-gui-close-btn" class="upgrader-gui-close-btn" type="button" aria-label="Zamknij panel">×</button>
+        <div id="upgrader-launcher-item-wrap" class="upgrader-launcher-item-wrap">
+          <div id="upgrader-launcher-item-box" class="upgrader-launcher-item-box"></div>
         </div>
-        <div class="upgrader-mode-wrap">
-          <div class="upgrader-mode-row">
-            <span class="upgrader-mode-label">Tryb działania</span>
-            <span id="upgrader-mode-value" class="upgrader-mode-value">ULEPSZANIE</span>
-            <label class="upgrader-mode-switch" for="upgrader-mode-toggle">
-              <input id="upgrader-mode-toggle" type="checkbox" />
-              <span class="upgrader-mode-slider"></span>
-            </label>
+
+        <div id="upgrader-launcher-progress-wrap" class="upgrader-launcher-progress-wrap">
+          <div class="upgrader-launcher-progress-track">
+            <div id="upgrader-launcher-progress-fill" class="upgrader-launcher-progress-fill" style="width:0%"></div>
+            <div id="upgrader-launcher-progress-label" class="upgrader-launcher-progress-label">-- / --</div>
           </div>
         </div>
-        <div id="upgrader-select-hint" class="upgrader-select-hint">Wybór przedmiotu: kliknij PPM na itemie i użyj opcji „Ulepsz ten przedmiot”.</div>
-        <div id="upgrader-selected-preview-wrap" class="upgrader-selected-preview-wrap">
-          <div class="upgrader-gui-rarity-title">Wybrany przedmiot:</div>
-          <div id="upgrader-selected-preview-box" class="upgrader-selected-preview-box"></div>
-          <div id="upgrader-selected-preview-text" class="upgrader-selected-preview-text">Brak wybranego przedmiotu</div>
-        </div>
-        <div class="upgrader-gui-rarity-wrap">
-          <div class="upgrader-gui-rarity-title">Rarity składników:</div>
-          <div id="upgrader-rarity-list" class="upgrader-gui-rarity-list"></div>
-        </div>
-        <div class="upgrader-bound-wrap">
-          <div class="upgrader-gui-rarity-title">Blokada przedmiotów związanych:</div>
-          <label class="upgrader-bound-item" for="upgrader-allow-soulbound">
-            <span>Używaj przedmiotów związanych z właścicielem</span>
-            <input id="upgrader-allow-soulbound" type="checkbox" />
-          </label>
-          <label class="upgrader-bound-item" for="upgrader-allow-permbound">
-            <span>Używaj przedmiotów związanych na stałe</span>
-            <input id="upgrader-allow-permbound" type="checkbox" />
-          </label>
-          <div class="upgrader-bound-warning">Uwaga: włączenie może spalić ważne przedmioty.
-            <span class="upgrader-tooltip-trigger" data-tooltip="Ta reguła nie działa na heroiki oraz na przedmioty ulepszone">?</span>
+
+        <div id="upgrader-launcher-counter" class="upgrader-launcher-counter">LIMIT: --/--</div>
+
+        <button id="upgrader-launcher-enhance-btn" class="upgrader-launcher-main-btn">ULEPSZ</button>
+
+        <div id="upgrader-settings-body" class="upgrader-settings-body">
+          <div id="upgrader-select-hint" class="upgrader-select-hint">Wybór przedmiotu: kliknij PPM na itemie i użyj opcji „Ulepsz ten przedmiot”.</div>
+
+          <div class="upgrader-card">
+            <div class="upgrader-auto-row">
+              <label id="upgrader-auto-label" for="upgrader-auto-enabled">Auto ulepszanie</label>
+              <input id="upgrader-auto-enabled" type="checkbox" />
+            </div>
+            <div class="upgrader-auto-row">
+              <label for="upgrader-auto-min-free-slots">Próg wolnych slotów: <span id="upgrader-auto-min-free-slots-value">6</span></label>
+            </div>
+            <input
+              id="upgrader-auto-min-free-slots"
+              class="upgrader-auto-slider"
+              type="range"
+              min="${CONFIG.AUTO_MIN_FREE_SLOTS_RANGE.min}"
+              max="${CONFIG.AUTO_MIN_FREE_SLOTS_RANGE.max}"
+              value="${CONFIG.DEFAULT_AUTO_SETTINGS.minFreeSlots}"
+            />
+            <div id="upgrader-auto-free-slots-info" class="upgrader-auto-info"></div>
           </div>
-        </div>
-        <div class="upgrader-auto-wrap">
-          <div class="upgrader-auto-row">
-            <label id="upgrader-auto-label" for="upgrader-auto-enabled">Auto ulepszanie</label>
-            <input id="upgrader-auto-enabled" type="checkbox" />
+
+          <div class="upgrader-grid-3">
+            <div class="upgrader-card">
+              <div class="upgrader-card-title">Rarity składników</div>
+              <div id="upgrader-rarity-list" class="upgrader-gui-rarity-list upgrader-gui-rarity-list-col"></div>
+            </div>
+
+            <div class="upgrader-card">
+              <div class="upgrader-card-title">Zwiazane przedmioty</div>
+              <label class="upgrader-bound-item" for="upgrader-allow-soulbound">
+                <span>Z właścicielem</span>
+                <input id="upgrader-allow-soulbound" type="checkbox" />
+              </label>
+              <label class="upgrader-bound-item" for="upgrader-allow-permbound">
+                <span>Na stałe</span>
+                <input id="upgrader-allow-permbound" type="checkbox" />
+              </label>
+              <div class="upgrader-bound-warning">Może spalić przedmioty.
+                <span class="upgrader-tooltip-trigger" data-tooltip="Ta reguła nie działa na heroiki oraz na przedmioty ulepszone">?</span>
+              </div>
+            </div>
+
+            <div class="upgrader-card">
+              <div class="upgrader-card-title">Skróty klawiszowe</div>
+              <div class="upgrader-hotkeys-grid">
+                <div class="upgrader-hotkeys-label">Ulepszanie</div>
+                <input id="upgrader-hotkey-enhance" maxlength="1" class="upgrader-hotkeys-input" />
+                <div class="upgrader-hotkeys-label">Ustawienia (SHIFT+)</div>
+                <input id="upgrader-hotkey-gui" maxlength="1" class="upgrader-hotkeys-input" />
+              </div>
+            </div>
           </div>
-          <div class="upgrader-auto-row">
-            <label for="upgrader-auto-min-free-slots">Próg wolnych slotów: <span id="upgrader-auto-min-free-slots-value">6</span></label>
+
+          <div class="upgrader-gui-row">
+            <button id="upgrader-clear-btn" class="upgrader-gui-btn">Wyczyść</button>
+            <button id="upgrader-rarity-save-btn" class="upgrader-gui-btn">Reset punktów</button>
+            <button id="upgrader-hotkey-save-btn" class="upgrader-gui-btn">Zapisz skróty</button>
           </div>
-          <input
-            id="upgrader-auto-min-free-slots"
-            class="upgrader-auto-slider"
-            type="range"
-            min="${CONFIG.AUTO_MIN_FREE_SLOTS_RANGE.min}"
-            max="${CONFIG.AUTO_MIN_FREE_SLOTS_RANGE.max}"
-            value="${CONFIG.DEFAULT_AUTO_SETTINGS.minFreeSlots}"
-          />
-          <div id="upgrader-auto-free-slots-info" class="upgrader-auto-info"></div>
-        </div>
-        <div class="upgrader-hotkeys-wrap">
-          <div class="upgrader-gui-rarity-title">Skróty klawiszowe:</div>
-          <div class="upgrader-hotkeys-grid">
-            <div class="upgrader-hotkeys-label">Ulepszanie</div>
-            <input id="upgrader-hotkey-enhance" maxlength="1" class="upgrader-hotkeys-input" />
-            <div class="upgrader-hotkeys-label">Rozbijanie</div>
-            <input id="upgrader-hotkey-salvage" maxlength="1" class="upgrader-hotkeys-input" />
-            <div class="upgrader-hotkeys-label">Ustawienia (SHIFT+)</div>
-            <input id="upgrader-hotkey-gui" maxlength="1" class="upgrader-hotkeys-input" />
-          </div>
-        </div>
-        <div class="upgrader-gui-row">
-          <button id="upgrader-clear-btn" class="upgrader-gui-btn">Wyczyść</button>
-          <button id="upgrader-rarity-save-btn" class="upgrader-gui-btn">Reset punktów</button>
-          <button id="upgrader-hotkey-save-btn" class="upgrader-gui-btn">Zapisz skróty</button>
         </div>
       `;
 
       document.body.appendChild(button);
-      document.body.appendChild(panel);
 
       Ui.applyButtonPosition();
-      Ui.applyPanelPosition();
       Ui.ensureFloatingUiVisible();
       state.viewportSize = Ui.getViewportSize();
       Ui.initViewportResizeHandler();
       Ui.initButtonDrag();
-      Ui.initPanelDrag();
       Ui.bindLauncherButtons();
       Ui.ensureInterfaceWidgetMounted();
       Ui.syncLauncherVisibility();
       Ui.bindAutoSettingsHandlers();
       Ui.bindBoundSettingsHandlers();
       Ui.bindRarityAutoSaveHandlers();
-      Ui.bindModeHandlers();
       Ui.bindTooltipHandlers();
 
       document
@@ -3874,6 +3581,7 @@ const ALLOWED_ITEM_TYPES = [
         .addEventListener("click", () => {
           state.dailyEnhancePoints = Storage.setDailyEnhancePoints(0);
           Ui.refreshDailyEnhancePoints();
+          Ui.refreshEnhanceCounter();
           message("Wyzerowano licznik punktów dziennych.");
         });
 
@@ -3884,30 +3592,18 @@ const ALLOWED_ITEM_TYPES = [
           const savedHotkeys = Storage.setHotkeys(nextHotkeys);
           state.hotkeys = savedHotkeys;
           Ui.renderHotkeyInputs();
+          Ui.renderModeDependentTexts();
         });
-
-      const closeButton = document.getElementById("upgrader-gui-close-btn");
-      if (closeButton) {
-        closeButton.addEventListener("mousedown", (event) => {
-          event.stopPropagation();
-        });
-
-        closeButton.addEventListener("click", (event) => {
-          event.preventDefault();
-          event.stopPropagation();
-          Ui.toggleGui();
-        });
-      }
 
       Ui.renderSelectedItemPreview();
-      Ui.enforceSafeRaritiesForMode();
-      Ui.renderModeSwitch();
       Ui.renderModeDependentTexts();
       Ui.renderRarityOptions();
       Ui.renderBoundSettings();
       Ui.renderAutoSettings();
       Ui.refreshEnhanceCounter();
       Ui.refreshDailyEnhancePoints();
+      Ui.refreshEnhanceProgress();
+      Ui.refreshReagentStock();
     },
 
     initItemContextMenu() {
@@ -3935,6 +3631,7 @@ const ALLOWED_ITEM_TYPES = [
                   Storage.setUpgradedItemId("");
                   Ui.markItemAsUpgraded(currentSelectedItemId);
                   Ui.renderSelectedItemPreview();
+                  Ui.refreshEnhanceProgress();
                 },
                 { button: { cls: "menu-item--red" } },
               ]
@@ -3944,6 +3641,7 @@ const ALLOWED_ITEM_TYPES = [
                   Storage.setUpgradedItemId(itemId);
                   Ui.markItemAsUpgraded(currentSelectedItemId);
                   Ui.renderSelectedItemPreview();
+                  Automation.queueProgressPeek();
                 },
                 { button: { cls: "menu-item--yellow" } },
               ];
@@ -3956,119 +3654,47 @@ const ALLOWED_ITEM_TYPES = [
 
   const Automation = {
     async runPrimaryAction(options = {}) {
-      if (state.mode === "salvage") {
-        return Automation.salvageEligibleItems(options);
-      }
-
       return Automation.enhanceSelectedItem(options);
     },
 
-    async salvageEligibleItems(options = {}) {
-      const { silent = false } = options;
-
-      const result = {
-        status: "idle",
-        reachedLimit: false,
-        reachedMaxEnhancement: false,
-        itemName: null,
-      };
-
-      if (state.isEnhancing) {
-        result.status = "busy";
-        return result;
+    queueProgressPeek() {
+      if (state.progressPeekTimer) {
+        clearTimeout(state.progressPeekTimer);
       }
+
+      state.progressPeekTimer = setTimeout(() => {
+        state.progressPeekTimer = null;
+        Automation.peekEnhanceProgress();
+      }, 300);
+    },
+
+    async peekEnhanceProgress() {
+      if (state.isEnhancing) return;
+
+      const itemId = Storage.getUpgradedItemId();
+      if (!itemId) {
+        Ui.refreshEnhanceProgress();
+        return;
+      }
+
+      const item = Engine.items.getItemById(itemId);
+      if (!item) return;
 
       state.isEnhancing = true;
-
-      const items = Inventory.getItemsForSalvage();
-      if (items.length === 0) {
-        result.status = "missing-reagents";
-        if (!silent) {
-          message("Nie znaleziono przedmiotów do rozbijania.");
-        }
-        state.isEnhancing = false;
-        return result;
-      }
-
-      let enhancementSession = null;
+      let session = null;
 
       try {
-        result.status = "running";
-        state.salvageReceivedItems = [];
-        enhancementSession = Ui.prepareEnhancementWindow();
-        await Utils.sleep(150);
-        const switchedToSalvage = await Ui.ensureCraftingModeTab();
-
-        if (!switchedToSalvage) {
-          result.status = "failed";
-          if (!silent) {
-            message("Nie udało się przełączyć zakładki rzemiosła na rozbijanie.", "err");
-          }
-          return result;
-        }
-
-        let successCount = 0;
-        let noProgressRounds = 0;
-
-        for (let round = 0; round < 120; round += 1) {
-          const remainingItems = Inventory.getItemsForSalvage();
-          if (remainingItems.length === 0) {
-            break;
-          }
-
-          const batch = remainingItems.slice(0, CONFIG.MAX_REAGENTS);
-          if (batch.length === 0) {
-            break;
-          }
-
-          const firstBatchItem = Engine.items.getItemById(batch[0]);
-          const tabReady = await Ui.ensureCraftingModeTab();
-          if (!tabReady) {
-            break;
-          }
-
-          await Utils.sleep(200);
-
-          const batchResult = await SalvageApi.salvageItemsBatchThroughUi(batch);
-          if (batchResult > 0) {
-            successCount += batchResult;
-            noProgressRounds = 0;
-            result.itemName = firstBatchItem?.name || result.itemName;
-          } else {
-            noProgressRounds += 1;
-          }
-
-          if (noProgressRounds >= 4) {
-            break;
-          }
-
-          await Utils.sleep(320);
-        }
-
-        const remainingItems = Inventory.getItemsForSalvage().length;
-
-        if (successCount > 0) {
-          result.status = "done";
-          if (!silent) {
-            Ui.showSalvageCompletionNotification({
-              count: successCount,
-              remainingItems: remainingItems,
-              receivedItems: state.salvageReceivedItems
-            });
-          }
-        } else {
-          result.status = "failed";
-          if (!silent) {
-            message("Nie udało się wykonać rozbijania (sprawdź aktywne okno rzemiosła).", "err");
-          }
-        }
+        session = Ui.prepareEnhancementWindow();
+        await EnhancementApi.setEnhancedItem(itemId);
+        Ui.refreshEnhanceProgress();
+      } catch (error) {
+        // Cichy podgląd — brak reagowania na błędy, spróbujemy przy kolejnym odświeżeniu.
       } finally {
-        state.salvageReceivedItems = [];
-        Ui.restoreEnhancementWindow(enhancementSession);
+        if (session) {
+          Ui.restoreEnhancementWindow(session);
+        }
         state.isEnhancing = false;
       }
-
-      return result;
     },
 
     async enhanceSelectedItem(options = {}) {
@@ -4300,9 +3926,8 @@ const ALLOWED_ITEM_TYPES = [
           enabled: false,
         });
 
-        const autoModeLabelCapitalized =
-          state.mode === "salvage" ? "Auto rozbijanie" : "Auto ulepszanie";
-        const limitLabel = state.mode === "salvage" ? "rozbić" : "ulepszeń";
+        const autoModeLabelCapitalized = "Auto ulepszanie";
+        const limitLabel = "ulepszeń";
 
         const targetItemLabel = enhanceResult.itemName
           ? ` dla ${enhanceResult.itemName}`
@@ -4330,6 +3955,8 @@ const ALLOWED_ITEM_TYPES = [
       setInterval(() => {
         Ui.refreshEnhanceCounter();
         Ui.refreshDailyEnhancePoints();
+        Ui.refreshEnhanceProgress();
+        Ui.refreshReagentStock();
       }, 1200);
     },
 
@@ -4342,8 +3969,7 @@ const ALLOWED_ITEM_TYPES = [
 
         const key = String(event.key || "").toLowerCase();
         const hotkeys = state.hotkeys || CONFIG.DEFAULT_HOTKEYS;
-        const activeActionHotkey =
-          state.mode === "salvage" ? hotkeys.salvage : hotkeys.enhance;
+        const activeActionHotkey = hotkeys.enhance;
 
         if (event.shiftKey && key === hotkeys.gui) {
           event.preventDefault();
@@ -4461,43 +4087,6 @@ const ALLOWED_ITEM_TYPES = [
       state.enhancementProgressHooked = true;
     },
 
-    initSalvageMessageHook() {
-      if (state.salvageMessageHooked) return;
-      if (typeof window.message !== "function") return;
-
-      const hookFlag = "__upgraderSalvageMessageHooked";
-      if (window.message && window.message[hookFlag]) {
-        state.salvageMessageHooked = true;
-        return;
-      }
-
-      const originalMessage = window.message;
-
-      window.message = function (...args) {
-        const text = String(args[0] || "");
-        const messageType = args[1];
-
-        // Całkowicie blokuj komunikaty "Otrzymano:" z rozbijania
-        if (text.startsWith("Otrzymano:")) {
-          // Wyciągnij nazwę przedmiotu (wszystko po "Otrzymano: ")
-          const itemText = text.replace(/^Otrzymano:\s*/, "").trim();
-          
-          // Zapisz przedmiot do tablicy jeśli jesteśmy w trakcie rozbijania
-          if (itemText && state.isEnhancing) {
-            state.salvageReceivedItems.push(itemText);
-          }
-          
-          // Nie wywołuj oryginalnego komunikatu - całkowicie zablokuj wyświetlanie
-          return;
-        }
-
-        // Dla pozostałych komunikatów wywołaj oryginalną funkcję
-        return originalMessage.apply(this, args);
-      };
-
-      window.message[hookFlag] = true;
-      state.salvageMessageHooked = true;
-    },
   };
 
   const Bootstrap = {
@@ -4515,20 +4104,11 @@ const ALLOWED_ITEM_TYPES = [
       state.hotkeys = Storage.getHotkeys();
       state.autoSettings = Storage.getAutoSettings();
       state.boundSettings = Storage.getBoundSettings();
-      state.mode = Storage.getMode();
       state.enhanceCounter = Storage.getEnhanceCounter();
       state.dailyEnhancePoints = Storage.getDailyEnhancePoints();
       state.launcherVisible = Storage.getLauncherVisibility();
 
-      if (state.mode === "salvage") {
-        const selectedRarities = Storage.getAllowedRarities();
-        Storage.setAllowedRarities(
-          selectedRarities.filter((rarity) => rarity !== "heroic")
-        );
-      }
-
       Runtime.initEnhancementProgressHook();
-      Runtime.initSalvageMessageHook();
       Ui.setupCss();
       Ui.createGui();
       Automation.bindHotkey();
@@ -4541,4 +4121,3 @@ const ALLOWED_ITEM_TYPES = [
 
   Bootstrap.init();
 })();
-
