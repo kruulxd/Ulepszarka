@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ulepszator by Kruul
 // @namespace    http://tampermonkey.net/
-// @version      0.2.3
+// @version      0.2.4
 // @description  Auto ulepszanie przedmiotów w Margonem (Quick Forge)
 // @author       Kruul
 // @match        https://*.margonem.pl/*
