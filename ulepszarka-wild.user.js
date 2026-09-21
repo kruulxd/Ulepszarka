@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ulepszator by Kruul
 // @namespace    http://tampermonkey.net/
-// @version      0.2.4
+// @version      0.2.5
 // @description  Auto ulepszanie przedmiotów w Margonem (Quick Forge)
 // @author       Kruul
 // @match        https://*.margonem.pl/*
@@ -61,6 +61,7 @@ const CONFIG = {
   BOOTSTRAP_MAX_ATTEMPTS: 120,
   BIND_STATE_CACHE_TTL_MS: 4000,
   AUTO_BACKOFF_MS: 30000,
+  PROGRESS_PEEK_MIN_INTERVAL_MS: 60000,
   DEFAULT_UI_SCALE: 1,
   UI_SCALE_STEP: 0.1,
   DEFAULT_DENSITY: "compact",
@@ -151,6 +152,7 @@ const ALLOWED_ITEM_TYPES = [
     isEnhancing: false,
     lastEnhanceProgress: null,
     progressPeekTimer: null,
+    lastProgressPeekAt: 0,
     lastAutoTriggerAt: 0,
     autoBackoffUntil: 0,
     sawEmptySlotMarkers: false,
@@ -442,32 +444,87 @@ const ALLOWED_ITEM_TYPES = [
   };
 
   const Storage = {
+    // Jedyne ustawienie per postac - to ID konkretnego przedmiotu z jej plecaka,
+    // wiec na innej postaci i tak nie mialoby sensu.
     getUpgradedItemKey() {
       return `upgrader-charId-${Engine.hero.d.id}`;
     },
 
+    // Reszta jest wspoldzielona miedzy postaciami.
     getRaritiesKey() {
-      return `upgrader-rarities-charId-${Engine.hero.d.id}`;
+      return "upgrader-rarities-shared";
     },
 
     getHotkeysKey() {
-      return `upgrader-hotkeys-charId-${Engine.hero.d.id}`;
+      return "upgrader-hotkeys-shared";
     },
 
     getGuiPositionKey() {
-      return `upgrader-button-position-charId-${Engine.hero.d.id}`;
+      return "upgrader-button-position-shared";
     },
 
     getWidgetSlotKey() {
-      return `upgrader-widget-slot-charId-${Engine.hero.d.id}`;
+      return "upgrader-widget-slot-shared";
     },
 
     getAutoSettingsKey() {
-      return `upgrader-auto-settings-charId-${Engine.hero.d.id}`;
+      return "upgrader-auto-settings-shared";
     },
 
     getBoundSettingsKey() {
-      return `upgrader-bound-settings-charId-${Engine.hero.d.id}`;
+      return "upgrader-bound-settings-shared";
+    },
+
+    getLauncherVisibilityKey() {
+      return "upgrader-launcher-visible-shared";
+    },
+
+    getUiScaleKey() {
+      return "upgrader-ui-scale-shared";
+    },
+
+    getDensityKey() {
+      return "upgrader-density-shared";
+    },
+
+    // Postep jest zwiazany z konkretnym przedmiotem, a wybrany przedmiot jest
+    // per postac - wiec i ten wpis trzymamy per postac.
+    getEnhanceProgressKey() {
+      return `upgrader-enhance-progress-charId-${Engine.hero.d.id}`;
+    },
+
+    getEnhanceProgress() {
+      const raw = window.localStorage.getItem(Storage.getEnhanceProgressKey());
+      if (!raw) return null;
+
+      try {
+        const parsed = JSON.parse(raw);
+        const itemId = String(parsed?.itemId ?? "").trim();
+        const current = Utils.toNumber(parsed?.current, NaN);
+        const target = Utils.toNumber(parsed?.target, NaN);
+
+        if (!itemId || !Number.isFinite(current) || !Number.isFinite(target)) {
+          return null;
+        }
+
+        return { itemId, current, target };
+      } catch (error) {
+        return null;
+      }
+    },
+
+    setEnhanceProgress(itemId, current, target) {
+      if (!itemId) return;
+
+      window.localStorage.setItem(
+        Storage.getEnhanceProgressKey(),
+        JSON.stringify({
+          itemId: String(itemId),
+          current,
+          target,
+          savedAt: Date.now(),
+        })
+      );
     },
 
     getEnhanceCounterKey() {
@@ -478,6 +535,7 @@ const ALLOWED_ITEM_TYPES = [
       return "upgrader-daily-enhance-points-shared";
     },
 
+    // Stare klucze per-postac - czytane tylko raz, przy migracji.
     getLegacyEnhanceCounterKey() {
       return `upgrader-enhance-counter-charId-${Engine.hero.d.id}`;
     },
@@ -486,12 +544,36 @@ const ALLOWED_ITEM_TYPES = [
       return `upgrader-daily-enhance-points-charId-${Engine.hero.d.id}`;
     },
 
-    getLauncherVisibilityKey() {
-      return `upgrader-launcher-visible-charId-${Engine.hero.d.id}`;
+    getLegacySettingKeys() {
+      const charId = Engine.hero.d.id;
+
+      return [
+        [Storage.getRaritiesKey(), `upgrader-rarities-charId-${charId}`],
+        [Storage.getHotkeysKey(), `upgrader-hotkeys-charId-${charId}`],
+        [Storage.getGuiPositionKey(), `upgrader-button-position-charId-${charId}`],
+        [Storage.getWidgetSlotKey(), `upgrader-widget-slot-charId-${charId}`],
+        [Storage.getAutoSettingsKey(), `upgrader-auto-settings-charId-${charId}`],
+        [Storage.getBoundSettingsKey(), `upgrader-bound-settings-charId-${charId}`],
+        [Storage.getLauncherVisibilityKey(), `upgrader-launcher-visible-charId-${charId}`],
+        [Storage.getUiScaleKey(), `upgrader-ui-scale-charId-${charId}`],
+        [Storage.getDensityKey(), `upgrader-density-charId-${charId}`],
+      ];
     },
 
-    getUiScaleKey() {
-      return `upgrader-ui-scale-charId-${Engine.hero.d.id}`;
+    // Ustawienia byly kiedys zapisywane osobno dla kazdej postaci. Przy pierwszym
+    // uruchomieniu przenosimy je z biezacej postaci na klucze wspoldzielone, zeby
+    // nikt nie stracil swojej konfiguracji.
+    migrateSettingsToShared() {
+      Storage.getLegacySettingKeys().forEach(([sharedKey, legacyKey]) => {
+        const legacyValue = window.localStorage.getItem(legacyKey);
+        if (legacyValue === null) return;
+
+        if (window.localStorage.getItem(sharedKey) === null) {
+          window.localStorage.setItem(sharedKey, legacyValue);
+        }
+
+        window.localStorage.removeItem(legacyKey);
+      });
     },
 
     getUiScale() {
@@ -518,10 +600,6 @@ const ALLOWED_ITEM_TYPES = [
       );
 
       return Math.round(normalized * 100) / 100;
-    },
-
-    getDensityKey() {
-      return `upgrader-density-charId-${Engine.hero.d.id}`;
     },
 
     getDensity() {
@@ -2609,19 +2687,49 @@ const ALLOWED_ITEM_TYPES = [
       );
       const freshProgress = Utils.parseProgressText(source?.textContent);
 
-      if (freshProgress) {
+      if (freshProgress && upgradedItemId) {
+        const previous = state.lastEnhanceProgress;
+        const changed =
+          !previous ||
+          previous.itemId !== upgradedItemId ||
+          previous.current !== freshProgress.current ||
+          previous.target !== freshProgress.target;
+
         state.lastEnhanceProgress = {
           itemId: upgradedItemId,
           current: freshProgress.current,
           target: freshProgress.target,
         };
+
+        // Zapis tylko przy zmianie - ta funkcja leci co 2 sekundy.
+        if (changed) {
+          Storage.setEnhanceProgress(
+            upgradedItemId,
+            freshProgress.current,
+            freshProgress.target
+          );
+        }
       }
 
+      let progress = null;
       const cached = state.lastEnhanceProgress;
-      const progress =
-        cached && cached.itemId === upgradedItemId
-          ? { current: cached.current, target: cached.target }
-          : null;
+
+      if (cached && cached.itemId === upgradedItemId) {
+        progress = { current: cached.current, target: cached.target };
+      } else if (upgradedItemId) {
+        // Po przeladowaniu strony pamiec jest pusta - siegamy po ostatni
+        // zapamietany odczyt, zeby nie pokazywac "-- / --" do czasu podgladu.
+        const stored = Storage.getEnhanceProgress();
+
+        if (stored && stored.itemId === String(upgradedItemId)) {
+          state.lastEnhanceProgress = {
+            itemId: upgradedItemId,
+            current: stored.current,
+            target: stored.target,
+          };
+          progress = { current: stored.current, target: stored.target };
+        }
+      }
 
       if (!progress) {
         fill.style.width = "0%";
@@ -4020,6 +4128,7 @@ const ALLOWED_ITEM_TYPES = [
         Ui.renderScaleSettings();
         Ui.renderDensitySettings();
         Ui.refreshEnhanceCounter();
+        Automation.ensureProgressKnown();
       }
     },
 
@@ -4288,24 +4397,60 @@ const ALLOWED_ITEM_TYPES = [
         return;
       }
 
-      const item = Engine.items.getItemById(itemId);
+      let item = null;
+      try {
+        item = Engine.items.getItemById(itemId);
+      } catch (error) {
+        item = null;
+      }
       if (!item) return;
 
       state.isEnhancing = true;
+      state.lastProgressPeekAt = Date.now();
       let session = null;
 
       try {
         session = Ui.prepareEnhancementWindow();
         await EnhancementApi.setEnhancedItem(itemId);
+
+        // Gra musi zdazyc przerysowac tekst postepu, zanim go odczytamy.
+        await Utils.nextFrame();
         Ui.refreshEnhanceProgress();
       } catch (error) {
-        // Cichy podgląd — brak reagowania na błędy, spróbujemy przy kolejnym odświeżeniu.
+        // Cichy podglad - przy kolejnym odswiezeniu sprobujemy ponownie.
       } finally {
         if (session) {
           Ui.restoreEnhancementWindow(session);
         }
         state.isEnhancing = false;
       }
+    },
+
+    // Cichy podglad (otwarcie okna ulepszania w tle i odczyt) odpala sie WYLACZNIE
+    // z akcji gracza: wyboru przedmiotu przez PPM albo rozwiniecia ustawien.
+    // Celowo nie ma tu nic automatycznego - przy starcie i przelogowaniu wartosc
+    // bierzemy z localStorage, bez odpytywania silnika.
+    ensureProgressKnown(options = {}) {
+      const { force = false } = options;
+
+      if (state.isEnhancing) return;
+
+      const itemId = Storage.getUpgradedItemId();
+      if (!itemId) return;
+
+      const isKnown =
+        state.lastEnhanceProgress && state.lastEnhanceProgress.itemId === itemId;
+      if (isKnown && !force) return;
+
+      const now = Date.now();
+      if (
+        !force &&
+        now - state.lastProgressPeekAt < CONFIG.PROGRESS_PEEK_MIN_INTERVAL_MS
+      ) {
+        return;
+      }
+
+      Automation.queueProgressPeek();
     },
 
     async enhanceSelectedItem(options = {}) {
@@ -4507,6 +4652,18 @@ const ALLOWED_ITEM_TYPES = [
       } finally {
         state.pendingPreviewPoints = null;
         state.enhancementRunSummary = null;
+
+        // Okno ulepszania jest tu jeszcze otwarte (w tle), wiec to ostatni moment
+        // na odczyt koncowego postepu - po zamknieciu wezel z tekstem znika.
+        // Bez tego krotki przebieg (jedna partia, ponizej 2 s) konczyl sie, zanim
+        // petla odswiezania zdazyla cokolwiek zobaczyc.
+        try {
+          await Utils.nextFrame();
+          Ui.refreshEnhanceProgress();
+        } catch (error) {
+          // Odczyt postepu nie moze zablokowac zamkniecia okna.
+        }
+
         Ui.restoreEnhancementWindow(enhancementSession);
         Inventory.invalidateBindStateCache();
         state.isEnhancing = false;
@@ -4816,6 +4973,7 @@ const ALLOWED_ITEM_TYPES = [
       }
 
       try {
+        Storage.migrateSettingsToShared();
         Storage.cleanupStaleEntries();
       } catch (error) {
         // Brak dostepu do localStorage nie moze blokowac startu dodatku.
