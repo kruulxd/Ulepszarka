@@ -1,14 +1,14 @@
 // ==UserScript==
 // @name         ulepszator by Kruul
 // @namespace    http://tampermonkey.net/
-// @version      0.2.5
+// @version      0.2.6
 // @description  Auto ulepszanie przedmiotów w Margonem (Quick Forge)
 // @author       Kruul
 // @match        https://*.margonem.pl/*
 // @updateURL    https://raw.githubusercontent.com/kruulxd/Ulepszarka/main/ulepszarka-wild.user.js
 // @downloadURL  https://raw.githubusercontent.com/kruulxd/Ulepszarka/main/ulepszarka-wild.user.js
 // @grant        none
-// ==/UserScript==
+// ==/UserScript==x
 
 const CONFIG = {
   DEFAULT_ALLOWED_RARITIES: ["common"],
@@ -153,6 +153,7 @@ const ALLOWED_ITEM_TYPES = [
     lastEnhanceProgress: null,
     progressPeekTimer: null,
     lastProgressPeekAt: 0,
+    windowItemId: null,
     lastAutoTriggerAt: 0,
     autoBackoffUntil: 0,
     sawEmptySlotMarkers: false,
@@ -1834,16 +1835,17 @@ const ALLOWED_ITEM_TYPES = [
           .upgrader-launcher-progress-label {
             position: relative;
             z-index: 1;
+            display: block;
+            box-sizing: border-box;
             height: 100%;
-            display: flex;
-            align-items: center;
-            justify-content: center;
+            line-height: calc(var(--ql-track-h) - 2px);
+            text-align: center;
             font-size: 11px;
             font-weight: 800;
             letter-spacing: 0.2px;
             color: #ffffff;
             text-shadow: 0 1px 2px rgba(0, 0, 0, 0.9), 0 0 4px rgba(0, 0, 0, 0.65);
-            padding: 0 4px;
+            padding: 0 5px;
             white-space: nowrap;
             overflow: hidden;
             text-overflow: ellipsis;
@@ -2687,7 +2689,16 @@ const ALLOWED_ITEM_TYPES = [
       );
       const freshProgress = Utils.parseProgressText(source?.textContent);
 
-      if (freshProgress && upgradedItemId) {
+      // Wezel z tekstem zostaje w DOM po zamknieciu okna i trzyma wartosci
+      // OSTATNIO zaladowanego przedmiotu. Bez tego sprawdzenia pierwszy tick
+      // po zmianie wyboru przypisywal cudze liczby nowemu przedmiotowi - i
+      // zapisywal je na stale.
+      const windowShowsSelectedItem =
+        state.windowItemId !== null &&
+        upgradedItemId !== null &&
+        state.windowItemId === String(upgradedItemId);
+
+      if (freshProgress && upgradedItemId && windowShowsSelectedItem) {
         const previous = state.lastEnhanceProgress;
         const changed =
           !previous ||
@@ -2734,6 +2745,7 @@ const ALLOWED_ITEM_TYPES = [
       if (!progress) {
         fill.style.width = "0%";
         label.textContent = "-- / --";
+        label.removeAttribute("title");
         return;
       }
 
@@ -2741,8 +2753,15 @@ const ALLOWED_ITEM_TYPES = [
         ? Utils.clamp(Math.round((progress.current / progress.target) * 100), 0, 100)
         : 0;
 
+      const currentText = Utils.formatPoints(progress.current);
+      const targetText = Utils.formatPoints(progress.target);
+
       fill.style.width = `${percent}%`;
-      label.textContent = `${Utils.formatPoints(progress.current)} / ${Utils.formatPoints(progress.target)} (${percent}%)`;
+
+      // Bez procentu w tekscie - pokazuje go wypelnienie paska, a kazdy znak
+      // wiecej to ryzyko, ze liczba zostanie przyciete i pokaze falszywa wartosc.
+      label.textContent = `${currentText} / ${targetText}`;
+      label.title = `${currentText} / ${targetText} (${percent}%)`;
     },
 
     refreshReagentStock() {
@@ -4411,7 +4430,13 @@ const ALLOWED_ITEM_TYPES = [
 
       try {
         session = Ui.prepareEnhancementWindow();
-        await EnhancementApi.setEnhancedItem(itemId);
+        const statusResponse = await EnhancementApi.setEnhancedItem(itemId);
+
+        // Dopiero teraz okno pokazuje ten przedmiot. Bez odpowiedzi serwera
+        // nie mamy pewnosci, wiec nie ufamy temu, co jest w DOM.
+        if (statusResponse) {
+          state.windowItemId = String(itemId);
+        }
 
         // Gra musi zdazyc przerysowac tekst postepu, zanim go odczytamy.
         await Utils.nextFrame();
@@ -4523,6 +4548,10 @@ const ALLOWED_ITEM_TYPES = [
         const chunks = Utils.chunk(reagents, CONFIG.MAX_REAGENTS);
         const statusResponse = await EnhancementApi.setEnhancedItem(upgradedItemId);
 
+        if (statusResponse) {
+          state.windowItemId = String(upgradedItemId);
+        }
+
         if (Utils.hasMaxEnhancementState(statusResponse)) {
           return stopAsMaxed();
         }
@@ -4582,6 +4611,10 @@ const ALLOWED_ITEM_TYPES = [
           );
 
           state.pendingPreviewPoints = null;
+
+          if (enhanceItemResponse) {
+            state.windowItemId = String(upgradedItemId);
+          }
 
           if (Utils.hasMaxEnhancementState(enhanceItemResponse)) {
             return stopAsMaxed();
