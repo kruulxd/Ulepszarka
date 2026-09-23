@@ -1,14 +1,14 @@
 // ==UserScript==
 // @name         ulepszator by Kruul
 // @namespace    http://tampermonkey.net/
-// @version      0.2.6
+// @version      0.2.7
 // @description  Auto ulepszanie przedmiotów w Margonem (Quick Forge)
 // @author       Kruul
 // @match        https://*.margonem.pl/*
 // @updateURL    https://raw.githubusercontent.com/kruulxd/Ulepszarka/main/ulepszarka-wild.user.js
 // @downloadURL  https://raw.githubusercontent.com/kruulxd/Ulepszarka/main/ulepszarka-wild.user.js
 // @grant        none
-// ==/UserScript==x
+// ==/UserScript==
 
 const CONFIG = {
   DEFAULT_ALLOWED_RARITIES: ["common"],
@@ -1462,32 +1462,75 @@ const ALLOWED_ITEM_TYPES = [
     // auto-ulepszanie odpalalo sie w kolko.
     getFreeSlotsInfo() {
       const EXCLUDED_BAG_SLOT_SELECTOR = ".bag-4-slot";
-      const EXCLUDED_BAG_SELECTOR = '[data-bag="26"]';
+      const EXCLUDED_BAG_INDEX = 26;
+      const EXCLUDED_BAG_SELECTOR = `[data-bag="${EXCLUDED_BAG_INDEX}"]`;
       const isInExcludedBagSlot = (node) =>
         Boolean(
           node?.closest?.(EXCLUDED_BAG_SLOT_SELECTOR) ||
             node?.closest?.(EXCLUDED_BAG_SELECTOR)
         );
 
-      const countExcludedBagEmptySlots = () =>
-        [
-          ...document.querySelectorAll(`${EXCLUDED_BAG_SELECTOR} .item.empty`),
-          ...document.querySelectorAll(`${EXCLUDED_BAG_SELECTOR} .slot.empty`),
-        ].length;
+      // Engine.bags to tablica [pojemnosc, zajete, idTorby] na torbe.
+      // Ostatnia pozycja to torba na klucze - silnik gry (updateBagAmount)
+      // nie wlicza jej do wolnych slotow, wiec my tez nie.
+      const readBagsSummary = () => {
+        const bags = window.Engine?.bags;
+        if (!Array.isArray(bags) || bags.length < 2) return null;
 
-      // 1. API gry, jesli w ogole istnieje i zwraca sensowna liczbe.
+        let capacity = 0;
+        let freeSlots = 0;
+
+        for (let index = 0; index < bags.length - 1; index++) {
+          const bag = bags[index];
+          if (!Array.isArray(bag)) continue;
+
+          const size = Number(bag[0]);
+          const used = Number(bag[1]);
+          if (!Number.isFinite(size) || !Number.isFinite(used)) continue;
+
+          capacity += size;
+          freeSlots += Math.max(0, size - used);
+        }
+
+        // Zerowa pojemnosc znaczy, ze ekwipunek jeszcze sie nie zaladowal -
+        // takiemu "0 wolnych slotow" nie wolno wierzyc.
+        if (capacity <= 0) return null;
+
+        return { capacity, freeSlots };
+      };
+
+      const bagsSummary = readBagsSummary();
+
+      // 1. API gry. Engine.heroEquipment.getFreeSlots() zwraca licznik silnika
+      //    (juz bez torby na klucze). Engine.items.getFreeSlots zostaje jako
+      //    stara sciezka - jesli nie istnieje albo nie zwraca liczby, lecimy dalej.
       const readEngineFreeSlots = () => {
-        const getter = window.Engine?.items?.getFreeSlots;
-        if (typeof getter !== "function") return null;
+        const sources = [
+          {
+            label: "Engine.heroEquipment.getFreeSlots",
+            owner: window.Engine?.heroEquipment,
+            argsList: [[]],
+          },
+          {
+            label: "Engine.items.getFreeSlots",
+            owner: window.Engine?.items,
+            argsList: [["g"], []],
+          },
+        ];
 
-        for (const args of [["g"], []]) {
-          try {
-            const value = getter.apply(window.Engine.items, args);
-            if (typeof value === "number" && Number.isFinite(value) && value >= 0) {
-              return value;
+        for (const { label, owner, argsList } of sources) {
+          const getter = owner?.getFreeSlots;
+          if (typeof getter !== "function") continue;
+
+          for (const args of argsList) {
+            try {
+              const value = getter.apply(owner, args);
+              if (typeof value === "number" && Number.isFinite(value) && value >= 0) {
+                return { freeSlots: value, source: label };
+              }
+            } catch (error) {
+              // Nastepna proba.
             }
-          } catch (error) {
-            // Nastepna proba.
           }
         }
 
@@ -1495,16 +1538,53 @@ const ALLOWED_ITEM_TYPES = [
       };
 
       const engineFreeSlots = readEngineFreeSlots();
-      if (engineFreeSlots !== null) {
-        const excludedBagEmptySlots = countExcludedBagEmptySlots();
-        return {
-          freeSlots: Math.max(0, engineFreeSlots - excludedBagEmptySlots),
-          source: "Engine.items.getFreeSlots",
-          excludedBagEmptySlots,
-        };
+
+      // Zeru z API ufamy dopiero, gdy z Engine.bags wynika, ze ekwipunek
+      // faktycznie sie zaladowal (inaczej to moze byc stan sprzed inicjalizacji).
+      if (engineFreeSlots !== null && (engineFreeSlots.freeSlots > 0 || bagsSummary)) {
+        return engineFreeSlots;
       }
 
-      // 2. Jawne znaczniki pustych slotow w DOM. Zeru ufamy dopiero wtedy, gdy
+      // 2. Liczenie wprost z Engine.bags, ta sama formula co w grze.
+      if (bagsSummary) {
+        return { freeSlots: bagsSummary.freeSlots, source: "Engine.bags" };
+      }
+
+      // 3. Liczniki wolnych miejsc wypisane przy ikonach torb w interfejsie.
+      const readBagNavigationFreeSlots = () => {
+        const nodes = [
+          ...document.querySelectorAll(".bags-navigation [data-bag]"),
+        ];
+        if (nodes.length === 0) return null;
+
+        let freeSlots = 0;
+        let readBags = 0;
+
+        for (const node of nodes) {
+          const bagIndex = Number(node.getAttribute("data-bag"));
+          if (!Number.isFinite(bagIndex) || bagIndex === EXCLUDED_BAG_INDEX) {
+            continue;
+          }
+
+          const text = node.querySelector(".amount")?.textContent?.trim();
+          if (!text) continue;
+
+          const value = Number.parseInt(text, 10);
+          if (!Number.isFinite(value)) continue;
+
+          freeSlots += Math.max(0, value);
+          readBags++;
+        }
+
+        return readBags > 0 ? freeSlots : null;
+      };
+
+      const navigationFreeSlots = readBagNavigationFreeSlots();
+      if (navigationFreeSlots !== null) {
+        return { freeSlots: navigationFreeSlots, source: "DOM .bags-navigation" };
+      }
+
+      // 4. Jawne znaczniki pustych slotow w DOM. Zeru ufamy dopiero wtedy, gdy
       //    wiemy, ze gra takie znaczniki w ogole renderuje - inaczej "0 pustych
       //    wezlow" znaczy tylko tyle, ze ten mechanizm tu nie wystepuje.
       const emptyNodes = [
@@ -1523,7 +1603,7 @@ const ALLOWED_ITEM_TYPES = [
         return { freeSlots, source: "DOM .empty" };
       }
 
-      // 3. Brak wiarygodnego zrodla - auto-ulepszanie po prostu sie nie odpali.
+      // 5. Brak wiarygodnego zrodla - auto-ulepszanie po prostu sie nie odpali.
       return { freeSlots: null, source: "brak zrodla" };
     },
 
